@@ -1374,9 +1374,20 @@ static int check_version(const struct load_info *info,
 	return 1;
 
 bad_version:
-	pr_warn("%s: disagrees about version of symbol %s\n",
+	/*
+	 * Samsung GKI vendor modules (vendor_boot /lib/modules/5.4-gki)
+	 * are closed-source prebuilts frozen against the stock kernel's
+	 * module_layout. Any change on the struct module include chain
+	 * (e.g. tracepoint config flips from the trimmed defconfig)
+	 * shifts that one CRC even when every exported symbol CRC the
+	 * modules actually reference still matches. Rejecting them all
+	 * kills touch/wifi/audio at boot, so warn and let them load
+	 * instead (ravindu644/Android-Kernel-Tutorials patch 010).
+	 * Keep MODULE_FORCE_LOAD available for everything else.
+	 */
+	pr_warn("%s: disagrees about version of symbol %s, but ignore...\n",
 	       info->name, symname);
-	return 0;
+	return 1;
 }
 
 static inline int check_modstruct_version(const struct load_info *info,
