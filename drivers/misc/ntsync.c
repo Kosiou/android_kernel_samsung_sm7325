@@ -1235,6 +1235,14 @@ static void ntsync_fix_perms_worker(struct work_struct *work)
 {
     struct path path;
     char *ctx = "u:object_r:gpu_device:s0";
+
+    /*
+     * 5.4 built-in (CONFIG_NTSYNC=y) adaptation: misc_register() runs
+     * long before Android init mounts the tmpfs on /dev, so the node
+     * cannot be fixed on the first try.  ueventd also ignores the
+     * miscdevice .mode hint and creates the node 0600.  Retry every 5s
+     * until /dev/ntsync exists and the relabel succeeds; stop once done.
+     */
     if (!kern_path("/dev/ntsync", LOOKUP_FOLLOW, &path)) {
         struct inode *inode = d_backing_inode(path.dentry);
         if (inode) {
@@ -1247,9 +1255,12 @@ static void ntsync_fix_perms_worker(struct work_struct *work)
 #endif
             inode->i_mode = (inode->i_mode & ~S_IALLUGO) | 0666;
             pr_info("ntsync: Applied 0666 and gpu_device context\n");
+            path_put(&path);
+            return;
         }
         path_put(&path);
     }
+    schedule_delayed_work(&ntsync_perm_work, msecs_to_jiffies(5000));
 }
 
 static const struct file_operations ntsync_fops = {
@@ -1277,6 +1288,7 @@ static int __init ntsync_init(void)
 
     INIT_DELAYED_WORK(&ntsync_perm_work, ntsync_fix_perms_worker);
     schedule_delayed_work(&ntsync_perm_work, msecs_to_jiffies(2000));
+
 
     return 0;
 }
