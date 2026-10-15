@@ -3600,6 +3600,19 @@ static bool blacklisted(const char *module_name)
 	const char *p;
 	size_t len;
 
+	/*
+	 * incrementalfs.ko is a Samsung prebuilt compiled against the stock
+	 * kernel's struct kstat layout. Our STATX_MNT_ID backport (commit
+	 * fa2fcf4f1df1) grows struct kstat by 8 bytes, so a loaded incfs
+	 * would have vfs_getattr() memset past the end of its stack kstat.
+	 * The CRC-override patch would happily let it load; refuse instead.
+	 * This device never mounts incremental-fs, nothing is lost.
+	 */
+	if (!strcmp(module_name, "incrementalfs")) {
+		pr_warn("module: refusing to load 'incrementalfs' (prebuilt is incompatible with STATX_MNT_ID backport)\n");
+		return true;
+	}
+
 	if (!module_blacklist)
 		return false;
 
