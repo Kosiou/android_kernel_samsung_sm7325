@@ -1131,3 +1131,6 @@ CONFIG_CAMERA_MCLK_DELAY=y
 CONFIG_PANEL_HX83121_PPC357DB11_WQXGA=y
 CONFIG_PANEL_FT8203_TS124QDM_WQXGA=y
 CONFIG_DISPLAY_SAMSUNG=y
+# NTSYNC: /dev/ntsync for Wine-based emulators (Winlator/Mobox); standalone
+# misc driver, no KABI impact
+CONFIG_NTSYNC=y
