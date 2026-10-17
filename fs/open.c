@@ -13,6 +13,7 @@
 #include <linux/module.h>
 #include <linux/tty.h>
 #include <linux/namei.h>
+#include <linux/openat2.h>
 #include <linux/backing-dev.h>
 #include <linux/capability.h>
 #include <linux/securebits.h>
@@ -1139,6 +1140,165 @@ SYSCALL_DEFINE4(openat, int, dfd, const char __user *, filename, int, flags,
 		flags |= O_LARGEFILE;
 
 	return do_sys_open(dfd, filename, flags, mode);
+}
+
+/*
+ * openat2(2) argument validation.
+ *
+ * This mirrors the upstream build_open_flags() for struct open_how.  The
+ * crucial difference from the open()/openat() path in build_open_flags()
+ * above is that openat2(2) validates every argument instead of silently
+ * masking off bits it does not know: unknown @flags and an unexpected @mode
+ * both yield -EINVAL.
+ */
+#define O_PATH_FLAGS		(O_DIRECTORY | O_NOFOLLOW | O_PATH | O_CLOEXEC)
+
+static inline int build_open_flags_how(const struct open_how *how,
+				       struct open_flags *op)
+{
+	u64 flags = how->flags;
+	u64 strip = FMODE_NONOTIFY | O_CLOEXEC;
+	int lookup_flags = 0;
+	int acc_mode = ACC_MODE(flags);
+
+	/*
+	 * Strip flags that shouldn't be set by userspace like FMODE_NONOTIFY
+	 * or that aren't relevant in determining struct open_flags like
+	 * O_CLOEXEC.
+	 */
+	flags &= ~strip;
+
+	/*
+	 * Older syscalls implicitly clear all of the invalid flags or argument
+	 * values before calling build_open_flags(), but openat2(2) checks all
+	 * of its arguments.
+	 */
+	if (flags & ~VALID_OPEN_FLAGS)
+		return -EINVAL;
+
+	/*
+	 * RESOLVE_* enforcement is added by the follow-up commit.  Rejecting
+	 * every non-zero @resolve for now keeps this commit free of any
+	 * changes to the path walk: bubblewrap (and flatpak through it) treat
+	 * EINVAL exactly like ENOSYS and fall back to safe_openat_fallback(),
+	 * so userspace behaviour is identical to a kernel without openat2(2).
+	 */
+	if (how->resolve)
+		return -EINVAL;
+
+	/* Deal with the mode. */
+	if (flags & (O_CREAT | __O_TMPFILE)) {
+		if (how->mode & ~S_IALLUGO)
+			return -EINVAL;
+		op->mode = how->mode | S_IFREG;
+	} else {
+		if (how->mode)
+			return -EINVAL;
+		op->mode = 0;
+	}
+
+	if (flags & __O_TMPFILE) {
+		if ((flags & O_TMPFILE_MASK) != O_TMPFILE)
+			return -EINVAL;
+		if (!(acc_mode & MAY_WRITE))
+			return -EINVAL;
+	} else if (flags & O_PATH) {
+		/* O_PATH only permits certain other flags to be set. */
+		if (flags & ~O_PATH_FLAGS)
+			return -EINVAL;
+		acc_mode = 0;
+	}
+
+	/*
+	 * O_SYNC is implemented as __O_SYNC|O_DSYNC.  As many places only
+	 * check for O_DSYNC if the need any syncing at all we enforce it's
+	 * always set instead of having to deal with possibly weird behaviour
+	 * for malicious applications setting only __O_SYNC.
+	 */
+	if (flags & __O_SYNC)
+		flags |= O_DSYNC;
+
+	op->open_flag = flags;
+
+	/* O_TRUNC implies we need access checks for write permissions */
+	if (flags & O_TRUNC)
+		acc_mode |= MAY_WRITE;
+
+	/* Allow the LSM permission hook to distinguish append
+	   access from general write access. */
+	if (flags & O_APPEND)
+		acc_mode |= MAY_APPEND;
+
+	op->acc_mode = acc_mode;
+
+	op->intent = flags & O_PATH ? 0 : LOOKUP_OPEN;
+
+	if (flags & O_CREAT) {
+		op->intent |= LOOKUP_CREATE;
+		if (flags & O_EXCL) {
+			op->intent |= LOOKUP_EXCL;
+			flags |= O_NOFOLLOW;
+		}
+	}
+
+	if (flags & O_DIRECTORY)
+		lookup_flags |= LOOKUP_DIRECTORY;
+	if (!(flags & O_NOFOLLOW))
+		lookup_flags |= LOOKUP_FOLLOW;
+
+	op->lookup_flags = lookup_flags;
+	return 0;
+}
+
+static long do_sys_openat2(int dfd, const char __user *filename,
+			   struct open_how __user *how_user, size_t size)
+{
+	struct open_how how;
+	struct open_flags op;
+	struct filename *tmp;
+	int fd;
+
+	if (copy_from_user(&how, how_user, sizeof(how)))
+		return -EFAULT;
+
+	/* Currently openat2(2) does not support any extensions. */
+	if (size != sizeof(how))
+		return -EINVAL;
+
+	fd = build_open_flags_how(&how, &op);
+	if (fd)
+		return fd;
+
+	tmp = getname(filename);
+	if (IS_ERR(tmp))
+		return PTR_ERR(tmp);
+
+	fd = get_unused_fd_flags(how.flags);
+	if (fd >= 0) {
+		struct file *f = do_filp_open(dfd, tmp, &op);
+
+#ifdef CONFIG_SECURITY_DEFEX
+		if (!IS_ERR(f) && task_defex_enforce(current, f, -__NR_openat)) {
+			fput(f);
+			f = ERR_PTR(-EPERM);
+		}
+#endif
+		if (IS_ERR(f)) {
+			put_unused_fd(fd);
+			fd = PTR_ERR(f);
+		} else {
+			fsnotify_open(f);
+			fd_install(fd, f);
+		}
+	}
+	putname(tmp);
+	return fd;
+}
+
+SYSCALL_DEFINE4(openat2, int, dfd, const char __user *, filename,
+		struct open_how __user *, how, size_t, usize)
+{
+	return do_sys_openat2(dfd, filename, how, usize);
 }
 
 #ifdef CONFIG_COMPAT
