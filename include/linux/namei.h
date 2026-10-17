@@ -39,6 +39,21 @@ enum {LAST_NORM, LAST_ROOT, LAST_DOT, LAST_DOTDOT, LAST_BIND};
 #define LOOKUP_ROOT		0x2000
 #define LOOKUP_ROOT_GRABBED	0x0008
 
+/*
+ * openat2(2) path resolution constraints (Linux 5.6).
+ *
+ * All sixteen low bits are taken on this tree, so these live above them;
+ * struct nameidata::flags is an unsigned int.
+ */
+#define LOOKUP_BENEATH		0x00100000	/* dirfd is the root: neither "..", an
+						 * absolute symlink nor a magic
+						 * link may escape it */
+#define LOOKUP_IN_ROOT		0x00200000	/* like LOOKUP_BENEATH but ".." and
+						 * jumps to "/" are scoped
+						 * instead of rejected */
+#define LOOKUP_NO_MAGICLINKS	0x00400000	/* disallow procfs-style magic links */
+#define LOOKUP_NO_SYMLINKS	0x00800000	/* disallow all symlink traversal */
+
 extern int path_pts(struct path *path);
 
 extern int user_path_at_empty(int, const char __user *, unsigned, struct path *, int *empty);
@@ -68,7 +83,7 @@ extern int follow_up(struct path *);
 extern struct dentry *lock_rename(struct dentry *, struct dentry *);
 extern void unlock_rename(struct dentry *, struct dentry *);
 
-extern void nd_jump_link(struct path *path);
+extern int nd_jump_link(struct path *path);
 
 static inline void nd_terminate_link(void *name, size_t len, size_t maxlen)
 {

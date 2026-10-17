@@ -925,6 +925,14 @@ static inline void path_to_nameidata(const struct path *path,
 
 static int nd_jump_root(struct nameidata *nd)
 {
+	/*
+	 * An absolute symlink target can never stay inside the dirfd under
+	 * LOOKUP_BENEATH.  Under LOOKUP_IN_ROOT the jump is fine: nd->root
+	 * has been set to the starting path by path_init().
+	 */
+	if (unlikely(nd->flags & LOOKUP_BENEATH))
+		return -EXDEV;
+
 	if (nd->flags & LOOKUP_RCU) {
 		struct dentry *d;
 		nd->path = nd->root;
@@ -947,14 +955,24 @@ static int nd_jump_root(struct nameidata *nd)
  * Helper to directly jump to a known parsed path from ->get_link,
  * caller must have taken a reference to path beforehand.
  */
-void nd_jump_link(struct path *path)
+int nd_jump_link(struct path *path)
 {
 	struct nameidata *nd = current->nameidata;
+
+	/*
+	 * nd_jump_link() is how procfs magic links (/proc/N/exe,
+	 * /proc/N/ns/*, ...) hand a fully resolved path to the walk, so it is
+	 * the one place where RESOLVE_NO_MAGICLINKS can be enforced.
+	 */
+	if (unlikely(nd->flags & LOOKUP_NO_MAGICLINKS))
+		return -ELOOP;
+
 	path_put(&nd->path);
 
 	nd->path = *path;
 	nd->inode = nd->path.dentry->d_inode;
 	nd->flags |= LOOKUP_JUMPED;
+	return 0;
 }
 
 static inline void put_link(struct nameidata *nd)
@@ -1133,6 +1151,9 @@ const char *get_link(struct nameidata *nd)
 	struct inode *inode = nd->link_inode;
 	int error;
 	const char *res;
+
+	if (unlikely(nd->flags & LOOKUP_NO_SYMLINKS))
+		return ERR_PTR(-ELOOP);
 
 	if (!(nd->flags & LOOKUP_RCU)) {
 		touch_atime(&last->link);
@@ -1447,8 +1468,17 @@ static int follow_dotdot_rcu(struct nameidata *nd)
 	struct inode *inode = nd->inode;
 
 	while (1) {
-		if (path_equal(&nd->path, &nd->root))
+		if (path_equal(&nd->path, &nd->root)) {
+			/*
+			 * At the root.  RESOLVE_BENEATH must not escape it,
+			 * RESOLVE_IN_ROOT stays put.  -ECHILD makes
+			 * do_filp_open() redo the lookup without LOOKUP_RCU
+			 * so the refwalk path returns the final error.
+			 */
+			if (unlikely(nd->flags & LOOKUP_BENEATH))
+				return -ECHILD;
 			break;
+		}
 		if (nd->path.dentry != nd->path.mnt->mnt_root) {
 			struct dentry *old = nd->path.dentry;
 			struct dentry *parent = old->d_parent;
@@ -1588,8 +1618,15 @@ static int path_parent_directory(struct path *path)
 static int follow_dotdot(struct nameidata *nd)
 {
 	while(1) {
-		if (path_equal(&nd->path, &nd->root))
+		if (path_equal(&nd->path, &nd->root)) {
+			/*
+			 * At the root.  RESOLVE_BENEATH must not escape it,
+			 * RESOLVE_IN_ROOT stays put.
+			 */
+			if (unlikely(nd->flags & LOOKUP_BENEATH))
+				return -EXDEV;
 			break;
+		}
 		if (nd->path.dentry != nd->path.mnt->mnt_root) {
 			int ret = path_parent_directory(&nd->path);
 			if (ret)
@@ -1599,6 +1636,7 @@ static int follow_dotdot(struct nameidata *nd)
 		if (!follow_up(&nd->path))
 			break;
 	}
+
 	follow_mount(&nd->path);
 	nd->inode = nd->path.dentry->d_inode;
 	return 0;
@@ -2308,7 +2346,13 @@ static const char *path_init(struct nameidata *nd, unsigned flags)
 	nd->path.dentry = NULL;
 
 	nd->m_seq = read_seqbegin(&mount_lock);
-	if (*s == '/') {
+	/*
+	 * RESOLVE_IN_ROOT treats the dirfd as the root, so an absolute path
+	 * is *not* resolved against the real root here - it is resolved
+	 * relative to the dirfd below, exactly like a relative path.  Leading
+	 * slashes are skipped by link_path_walk().
+	 */
+	if (*s == '/' && !(flags & LOOKUP_IN_ROOT)) {
 		set_root(nd);
 		if (likely(!nd_jump_root(nd)))
 			return s;
@@ -2328,7 +2372,7 @@ static const char *path_init(struct nameidata *nd, unsigned flags)
 			get_fs_pwd(current->fs, &nd->path);
 			nd->inode = nd->path.dentry->d_inode;
 		}
-		return s;
+		goto scoped_root;
 	} else {
 		/* Caller must check execute permissions on the starting path component */
 		struct fd f = fdget_raw(nd->dfd);
@@ -2353,6 +2397,23 @@ static const char *path_init(struct nameidata *nd, unsigned flags)
 			nd->inode = nd->path.dentry->d_inode;
 		}
 		fdput(f);
+scoped_root:
+		/*
+		 * For a scoped lookup (RESOLVE_BENEATH / RESOLVE_IN_ROOT) the
+		 * starting path *is* the root.  With that in place the ".."
+		 * clamping in follow_dotdot() and the jump for absolute
+		 * symlinks in nd_jump_root() give RESOLVE_IN_ROOT its chroot
+		 * like semantics without any further special casing.
+		 */
+		if (flags & (LOOKUP_IN_ROOT | LOOKUP_BENEATH)) {
+			nd->root = nd->path;
+			if (flags & LOOKUP_RCU) {
+				nd->root_seq = nd->seq;
+			} else {
+				path_get(&nd->root);
+				nd->flags |= LOOKUP_ROOT_GRABBED;
+			}
+		}
 		return s;
 	}
 }

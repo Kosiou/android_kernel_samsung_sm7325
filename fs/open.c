@@ -1153,6 +1153,16 @@ SYSCALL_DEFINE4(openat, int, dfd, const char __user *, filename, int, flags,
  */
 #define O_PATH_FLAGS		(O_DIRECTORY | O_NOFOLLOW | O_PATH | O_CLOEXEC)
 
+/*
+ * RESOLVE_* bits this backport implements.  RESOLVE_NO_XDEV is deliberately
+ * left out: blocking mount traversal means hooking both the RCU and the
+ * refwalk mount-crossing paths, and a half-implemented NO_XDEV is a sandbox
+ * escape rather than a restriction.  Asking for it returns -EINVAL, which
+ * userspace can detect.  RESOLVE_CACHED (6.12+) is not implemented either.
+ */
+#define VALID_RESOLVE_FLAGS	(RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS | \
+				 RESOLVE_BENEATH | RESOLVE_IN_ROOT)
+
 static inline int build_open_flags_how(const struct open_how *how,
 				       struct open_flags *op)
 {
@@ -1177,13 +1187,14 @@ static inline int build_open_flags_how(const struct open_how *how,
 		return -EINVAL;
 
 	/*
-	 * RESOLVE_* enforcement is added by the follow-up commit.  Rejecting
-	 * every non-zero @resolve for now keeps this commit free of any
-	 * changes to the path walk: bubblewrap (and flatpak through it) treat
-	 * EINVAL exactly like ENOSYS and fall back to safe_openat_fallback(),
-	 * so userspace behaviour is identical to a kernel without openat2(2).
+	 * RESOLVE_* enforcement is driven entirely by the LOOKUP_*
+	 * counterparts set below, so an unknown resolve bit has to be
+	 * rejected here.  BENEATH and IN_ROOT are mutually exclusive: they
+	 * describe opposite reactions to an escape attempt.
 	 */
-	if (how->resolve)
+	if (how->resolve & ~VALID_RESOLVE_FLAGS)
+		return -EINVAL;
+	if ((how->resolve & RESOLVE_BENEATH) && (how->resolve & RESOLVE_IN_ROOT))
 		return -EINVAL;
 
 	/* Deal with the mode. */
@@ -1245,6 +1256,16 @@ static inline int build_open_flags_how(const struct open_how *how,
 		lookup_flags |= LOOKUP_DIRECTORY;
 	if (!(flags & O_NOFOLLOW))
 		lookup_flags |= LOOKUP_FOLLOW;
+
+	/* RESOLVE_* -> LOOKUP_* */
+	if (how->resolve & RESOLVE_NO_MAGICLINKS)
+		lookup_flags |= LOOKUP_NO_MAGICLINKS;
+	if (how->resolve & RESOLVE_NO_SYMLINKS)
+		lookup_flags |= LOOKUP_NO_SYMLINKS;
+	if (how->resolve & RESOLVE_BENEATH)
+		lookup_flags |= LOOKUP_BENEATH;
+	if (how->resolve & RESOLVE_IN_ROOT)
+		lookup_flags |= LOOKUP_IN_ROOT;
 
 	op->lookup_flags = lookup_flags;
 	return 0;
