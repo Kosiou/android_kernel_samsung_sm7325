@@ -4655,6 +4655,15 @@ static int build_mount_kattr(const struct mount_attr *attr, size_t usize,
 	if (attr->propagation)
 		return -EINVAL;
 
+	/*
+	 * A non-zero @userns_fd only makes sense together with
+	 * MOUNT_ATTR_IDMAP, which this backport does not implement.  Reject it
+	 * instead of ignoring it: silently dropping an idmap request would hand
+	 * the caller a mount that is not mapped the way it asked for.
+	 */
+	if (attr->userns_fd)
+		return -EINVAL;
+
 	if ((attr->attr_set | attr->attr_clr) & ~FSMOUNT_VALID_FLAGS)
 		return -EINVAL;
 

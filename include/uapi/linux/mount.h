@@ -119,10 +119,11 @@ enum fsconfig_command {
 
 /* Argument for the mount_setattr(2) syscall. */
 struct mount_attr {
-	__u64 attr_clr;	/* Mount attribute flags to clear */
 	__u64 attr_set;	/* Mount attribute flags to set */
+	__u64 attr_clr;	/* Mount attribute flags to clear */
 	__u64 propagation; /* Propagation flags to set (0 to not change) */
+	__u64 userns_fd; /* User namespace file descriptor (0 to not change) */
 };
-#define MOUNT_ATTR_SIZE_VER0	32 /* size of the initial version of struct mount_attr */
+#define MOUNT_ATTR_SIZE_VER0	32 /* sizeof first published struct */
 
 #endif /* _UAPI_LINUX_MOUNT_H */
