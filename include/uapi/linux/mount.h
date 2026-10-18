@@ -117,4 +117,12 @@ enum fsconfig_command {
 #define MOUNT_ATTR_STRICTATIME	0x00000020 /* - Always perform atime updates */
 #define MOUNT_ATTR_NODIRATIME	0x00000080 /* Do not update directory access times */
 
+/* Argument for the mount_setattr(2) syscall. */
+struct mount_attr {
+	__u64 attr_clr;	/* Mount attribute flags to clear */
+	__u64 attr_set;	/* Mount attribute flags to set */
+	__u64 propagate; /* Propagation flags to set (0 to not change) */
+};
+#define MOUNT_ATTR_SIZE_VER0	32 /* size of the initial version of struct mount_attr */
+
 #endif /* _UAPI_LINUX_MOUNT_H */
