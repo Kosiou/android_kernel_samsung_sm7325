@@ -43,6 +43,7 @@ static const char *proc_ns_get_link(struct dentry *dentry,
 	struct task_struct *task;
 	struct path ns_path;
 	void *error = ERR_PTR(-EACCES);
+	int err;
 
 	if (!dentry)
 		return ERR_PTR(-ECHILD);
@@ -53,8 +54,11 @@ static const char *proc_ns_get_link(struct dentry *dentry,
 
 	if (ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS)) {
 		error = ns_get_path(&ns_path, task, ns_ops);
-		if (!error)
-			error = nd_jump_link(&ns_path);
+		if (!error) {
+			err = nd_jump_link(&ns_path);
+			if (err)
+				error = ERR_PTR(err);
+		}
 	}
 	put_task_struct(task);
 	return error;

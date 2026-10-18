@@ -960,9 +960,9 @@ int nd_jump_link(struct path *path)
 	struct nameidata *nd = current->nameidata;
 
 	/*
-	 * nd_jump_link() is how procfs magic links (/proc/N/exe,
-	 * /proc/N/ns/*, ...) hand a fully resolved path to the walk, so it is
-	 * the one place where RESOLVE_NO_MAGICLINKS can be enforced.
+	 * nd_jump_link() is how procfs magic links (proc/N/exe, proc/N/ns
+	 * and friends) hand a fully resolved path to the walk, so it is the
+	 * one place where RESOLVE_NO_MAGICLINKS can be enforced.
 	 */
 	if (unlikely(nd->flags & LOOKUP_NO_MAGICLINKS))
 		return -ELOOP;

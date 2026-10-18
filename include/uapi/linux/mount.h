@@ -121,7 +121,7 @@ enum fsconfig_command {
 struct mount_attr {
 	__u64 attr_clr;	/* Mount attribute flags to clear */
 	__u64 attr_set;	/* Mount attribute flags to set */
-	__u64 propagate; /* Propagation flags to set (0 to not change) */
+	__u64 propagation; /* Propagation flags to set (0 to not change) */
 };
 #define MOUNT_ATTR_SIZE_VER0	32 /* size of the initial version of struct mount_attr */
 
