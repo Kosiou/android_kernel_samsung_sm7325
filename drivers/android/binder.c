@@ -75,6 +75,9 @@
 #include "binder_internal.h"
 #include "binder_trace.h"
 #include <trace/hooks/binder.h>
+#ifdef CONFIG_REKERNEL
+#include <../rekernel/rekernel.h>
+#endif
 #ifdef CONFIG_SAMSUNG_FREECESS
 #include <linux/freecess.h>
 #endif
@@ -2825,6 +2828,37 @@ static int binder_fixup_parent(struct list_head *pf_head,
  *		BR_DEAD_REPLY if the target process or thread is dead
  *		BR_FROZEN_REPLY if the target process or thread is frozen
  */
+#ifdef CONFIG_REKERNEL
+static void rekernel_binder_transaction(bool reply,
+		struct binder_transaction *t,
+		struct binder_node *target_node,
+		struct binder_transaction_data *tr)
+{
+	struct binder_proc *to_proc;
+	struct binder_alloc *target_alloc;
+
+	if (!t || !t->to_proc)
+		return;
+
+	to_proc = t->to_proc;
+	if (reply) {
+		binder_reply_handler(task_tgid_nr(current), current,
+			to_proc->pid, to_proc->tsk, false, tr);
+	} else if (t->from && t->from->proc) {
+		binder_trans_handler(t->from->proc->pid, t->from->proc->tsk,
+			to_proc->pid, to_proc->tsk, false, tr);
+	} else {
+		binder_trans_handler(task_tgid_nr(current), current,
+			to_proc->pid, to_proc->tsk, true, tr);
+		target_alloc = &to_proc->alloc;
+		if (target_alloc->free_async_space <
+			(target_alloc->buffer_size / 10 + 0x300))
+			binder_overflow_handler(task_tgid_nr(current), current,
+				to_proc->pid, to_proc->tsk, true, tr);
+	}
+}
+#endif
+
 static int binder_proc_transaction(struct binder_transaction *t,
 				    struct binder_proc *proc,
 				    struct binder_thread *thread)
@@ -3325,6 +3359,9 @@ static void binder_transaction(struct binder_proc *proc,
 	}
 
 	trace_binder_transaction(reply, t, target_node);
+#ifdef CONFIG_REKERNEL
+	rekernel_binder_transaction(reply, t, target_node, tr);
+#endif
 
 	t->buffer = binder_alloc_new_buf(&target_proc->alloc, tr->data_size,
 		tr->offsets_size, extra_buffers_size,

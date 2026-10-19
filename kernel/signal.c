@@ -56,6 +56,9 @@
 #include <asm/unistd.h>
 #include <asm/siginfo.h>
 #include <asm/cacheflush.h>
+#ifdef CONFIG_REKERNEL
+#include <../drivers/rekernel/rekernel.h>
+#endif
 #ifdef CONFIG_SAMSUNG_FREECESS
 #include <linux/freecess.h>
 #endif
@@ -1300,6 +1303,11 @@ int do_send_sig_info(int sig, struct kernel_siginfo *info, struct task_struct *p
 {
 	unsigned long flags;
 	int ret = -ESRCH;
+#ifdef CONFIG_REKERNEL
+	if (sig == SIGKILL || sig == SIGTERM || sig == SIGABRT || sig == SIGQUIT)
+		rekernel_report(SIGNAL, sig, task_tgid_nr(current), current,
+			task_tgid_nr(p), p, false, NULL);
+#endif
 #ifdef CONFIG_SAMSUNG_FREECESS
 	/*
 	 * System will send SIGIO to the app that locked the file when other apps access the file.

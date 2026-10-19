@@ -1134,3 +1134,6 @@ CONFIG_DISPLAY_SAMSUNG=y
 # NTSYNC: /dev/ntsync for Wine-based emulators (Winlator/Mobox); standalone
 # misc driver, no KABI impact
 CONFIG_NTSYNC=y
+CONFIG_REKERNEL=y
+# Keep network reporting disabled unless explicitly enabled by the userspace client.
+CONFIG_REKERNEL_NETWORK=n
