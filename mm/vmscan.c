@@ -2921,9 +2921,6 @@ void forced_shrink_node_memcg(struct pglist_data *pgdat, struct mem_cgroup *memc
 /*
  * This is a basic per-node page freer.  Used by both kswapd and direct reclaim.
  */
-}
-#endif
-
 #ifdef CONFIG_LRU_GEN
 
 #ifdef CONFIG_LRU_GEN_ENABLED
