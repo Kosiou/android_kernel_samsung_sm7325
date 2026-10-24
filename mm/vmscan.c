@@ -4978,12 +4978,12 @@ static void lru_gen_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc
 		int swappiness;
 		unsigned long nr_to_scan;
 
-		if (sc->may_swap)
-			swappiness = get_swappiness(lruvec, sc);
-		else if (global_reclaim(sc) && get_swappiness(lruvec, sc))
-			swappiness = 1;
-		else
+		if (!sc->may_swap ||
+		    (current_is_kswapd() && need_memory_boosting() &&
+		     !is_too_low_file()))
 			swappiness = 0;
+		else
+			swappiness = get_swappiness(lruvec, sc);
 
 		nr_to_scan = get_nr_to_scan(lruvec, sc, swappiness, &need_aging);
 		if (!nr_to_scan)
