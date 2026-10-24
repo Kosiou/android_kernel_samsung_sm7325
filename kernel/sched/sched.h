@@ -1928,6 +1928,12 @@ struct sched_class {
 
 	void (*update_curr)(struct rq *rq);
 
+#ifdef CONFIG_SCHED_WALT
+	void (*fixup_walt_sched_stats)(struct rq *rq, struct task_struct *p,
+				       u16 updated_demand_scaled,
+				       u16 updated_pred_demand_scaled);
+#endif
+
 #define TASK_SET_GROUP		0
 #define TASK_MOVE_GROUP		1
 

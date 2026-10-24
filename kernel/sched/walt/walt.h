@@ -19,6 +19,9 @@ extern cpumask_t __read_mostly **cpu_array;
 extern void
 walt_update_task_ravg(struct task_struct *p, struct rq *rq, int event,
 						u64 wallclock, u64 irqtime);
+void fixup_walt_sched_stats_common(struct rq *rq, struct task_struct *p,
+				   u16 updated_demand_scaled,
+				   u16 updated_pred_demand_scaled);
 
 static inline void
 fixup_cumulative_runnable_avg(struct walt_sched_stats *stats,

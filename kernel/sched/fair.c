@@ -4740,6 +4740,130 @@ static inline int throttled_hierarchy(struct cfs_rq *cfs_rq)
 	return cfs_bandwidth_used() && cfs_rq->throttle_count;
 }
 
+#ifdef CONFIG_SCHED_WALT
+/*
+ * WALT normally aggregates directly into rq->wrq. With hierarchical fair
+ * groups enabled, keep a matching aggregate on every cfs_rq so bandwidth
+ * throttling can remove and restore a group's contribution without losing
+ * WALT placement information.
+ */
+static void walt_inc_cfs_rq_stats(struct cfs_rq *cfs_rq,
+				  struct task_struct *p)
+{
+	fixup_cumulative_runnable_avg(&cfs_rq->walt_stats,
+				      p->wts.demand_scaled,
+				      p->wts.pred_demand_scaled);
+
+	if (p->wts.misfit)
+		cfs_rq->walt_stats.nr_big_tasks++;
+	if (p->wts.rtg_high_prio)
+		cfs_rq->walt_stats.nr_rtg_high_prio_tasks++;
+}
+
+static void walt_dec_cfs_rq_stats(struct cfs_rq *cfs_rq,
+				  struct task_struct *p)
+{
+	fixup_cumulative_runnable_avg(&cfs_rq->walt_stats,
+				      -(s64)p->wts.demand_scaled,
+				      -(s64)p->wts.pred_demand_scaled);
+
+	if (p->wts.misfit)
+		cfs_rq->walt_stats.nr_big_tasks--;
+	if (p->wts.rtg_high_prio)
+		cfs_rq->walt_stats.nr_rtg_high_prio_tasks--;
+
+	BUG_ON(cfs_rq->walt_stats.nr_big_tasks < 0);
+	BUG_ON(cfs_rq->walt_stats.nr_rtg_high_prio_tasks < 0);
+}
+
+static void walt_dec_throttled_cfs_rq_stats(
+		struct walt_sched_stats *stats,
+		struct cfs_rq *throttled_cfs_rq)
+{
+	struct rq *rq = rq_of(throttled_cfs_rq);
+	struct walt_sched_stats *throttled_stats =
+		&throttled_cfs_rq->walt_stats;
+
+	fixup_cumulative_runnable_avg(stats,
+				      -(s64)throttled_stats->cumulative_runnable_avg_scaled,
+				      -(s64)throttled_stats->pred_demands_sum_scaled);
+	stats->nr_big_tasks -= throttled_stats->nr_big_tasks;
+	stats->nr_rtg_high_prio_tasks -=
+		throttled_stats->nr_rtg_high_prio_tasks;
+
+	BUG_ON(stats->nr_big_tasks < 0);
+	BUG_ON(stats->nr_rtg_high_prio_tasks < 0);
+
+	if (stats == &rq->wrq.walt_stats)
+		walt_fixup_cum_window_demand(rq,
+					     -(s64)throttled_stats->cumulative_runnable_avg_scaled);
+}
+
+static void walt_inc_throttled_cfs_rq_stats(
+		struct walt_sched_stats *stats,
+		struct cfs_rq *throttled_cfs_rq)
+{
+	struct rq *rq = rq_of(throttled_cfs_rq);
+	struct walt_sched_stats *throttled_stats =
+		&throttled_cfs_rq->walt_stats;
+
+	fixup_cumulative_runnable_avg(stats,
+				      throttled_stats->cumulative_runnable_avg_scaled,
+				      throttled_stats->pred_demands_sum_scaled);
+	stats->nr_big_tasks += throttled_stats->nr_big_tasks;
+	stats->nr_rtg_high_prio_tasks +=
+		throttled_stats->nr_rtg_high_prio_tasks;
+
+	if (stats == &rq->wrq.walt_stats)
+		walt_fixup_cum_window_demand(rq,
+					     throttled_stats->cumulative_runnable_avg_scaled);
+}
+
+static void walt_fixup_sched_stats_fair(struct rq *rq, struct task_struct *p,
+					u16 updated_demand_scaled,
+					u16 updated_pred_demand_scaled)
+{
+	s64 task_load_delta = (s64)updated_demand_scaled -
+			      p->wts.demand_scaled;
+	s64 pred_demand_delta = (s64)updated_pred_demand_scaled -
+				p->wts.pred_demand_scaled;
+	struct sched_entity *se = &p->se;
+	struct cfs_rq *cfs_rq;
+
+	for_each_sched_entity(se) {
+		cfs_rq = cfs_rq_of(se);
+		fixup_cumulative_runnable_avg(&cfs_rq->walt_stats,
+					      task_load_delta,
+					      pred_demand_delta);
+		if (cfs_rq_throttled(cfs_rq))
+			break;
+	}
+
+	if (!se)
+		fixup_walt_sched_stats_common(rq, p,
+					      updated_demand_scaled,
+					      updated_pred_demand_scaled);
+}
+
+static void walt_fixup_nr_big_tasks(struct rq *rq, struct task_struct *p,
+				    int delta, bool inc)
+{
+	struct sched_entity *se = &p->se;
+	struct cfs_rq *cfs_rq;
+
+	for_each_sched_entity(se) {
+		cfs_rq = cfs_rq_of(se);
+		cfs_rq->walt_stats.nr_big_tasks += inc ? delta : -delta;
+		BUG_ON(cfs_rq->walt_stats.nr_big_tasks < 0);
+		if (cfs_rq_throttled(cfs_rq))
+			break;
+	}
+
+	if (!se)
+		walt_adjust_nr_big_tasks(rq, delta, inc);
+}
+#endif /* CONFIG_SCHED_WALT */
+
 /*
  * Ensure that neither of the group entities corresponding to src_cpu or
  * dest_cpu are members of a throttled hierarchy when performing group
@@ -4796,6 +4920,9 @@ static bool throttle_cfs_rq(struct cfs_rq *cfs_rq)
 	struct cfs_bandwidth *cfs_b = tg_cfs_bandwidth(cfs_rq->tg);
 	struct sched_entity *se;
 	long task_delta, idle_task_delta, dequeue = 1;
+#ifdef CONFIG_SCHED_WALT
+	struct cfs_rq *throttled_cfs_rq = cfs_rq;
+#endif
 
 	raw_spin_lock(&cfs_b->lock);
 	/* This will start the period timer if necessary */
@@ -4837,13 +4964,22 @@ static bool throttle_cfs_rq(struct cfs_rq *cfs_rq)
 			dequeue_entity(qcfs_rq, se, DEQUEUE_SLEEP);
 		qcfs_rq->h_nr_running -= task_delta;
 		qcfs_rq->idle_h_nr_running -= idle_task_delta;
+#ifdef CONFIG_SCHED_WALT
+		walt_dec_throttled_cfs_rq_stats(&qcfs_rq->walt_stats,
+						throttled_cfs_rq);
+#endif
 
 		if (qcfs_rq->load.weight)
 			dequeue = 0;
 	}
 
-	if (!se)
+	if (!se) {
 		sub_nr_running(rq, task_delta);
+#ifdef CONFIG_SCHED_WALT
+		walt_dec_throttled_cfs_rq_stats(&rq->wrq.walt_stats,
+						throttled_cfs_rq);
+#endif
+	}
 
 	/*
 	 * Note: distribution will already see us throttled via the
@@ -4860,6 +4996,9 @@ void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
 	struct cfs_bandwidth *cfs_b = tg_cfs_bandwidth(cfs_rq->tg);
 	struct sched_entity *se;
 	long task_delta, idle_task_delta;
+#ifdef CONFIG_SCHED_WALT
+	struct cfs_rq *throttled_cfs_rq = cfs_rq;
+#endif
 
 	se = cfs_rq->tg->se[cpu_of(rq)];
 
@@ -4888,6 +5027,10 @@ void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
 
 		cfs_rq->h_nr_running += task_delta;
 		cfs_rq->idle_h_nr_running += idle_task_delta;
+#ifdef CONFIG_SCHED_WALT
+		walt_inc_throttled_cfs_rq_stats(&cfs_rq->walt_stats,
+						throttled_cfs_rq);
+#endif
 
 		/* end evaluation on encountering a throttled cfs_rq */
 		if (cfs_rq_throttled(cfs_rq))
@@ -4899,6 +5042,10 @@ void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
 
 		cfs_rq->h_nr_running += task_delta;
 		cfs_rq->idle_h_nr_running += idle_task_delta;
+#ifdef CONFIG_SCHED_WALT
+		walt_inc_throttled_cfs_rq_stats(&cfs_rq->walt_stats,
+						throttled_cfs_rq);
+#endif
 
 
 		/* end evaluation on encountering a throttled cfs_rq */
@@ -4915,6 +5062,10 @@ void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
 
 	/* At this point se is NULL and we are at root level*/
 	add_nr_running(rq, task_delta);
+#ifdef CONFIG_SCHED_WALT
+	walt_inc_throttled_cfs_rq_stats(&rq->wrq.walt_stats,
+					throttled_cfs_rq);
+#endif
 
 unthrottle_throttle:
 	/*
@@ -5443,6 +5594,22 @@ static inline void destroy_cfs_bandwidth(struct cfs_bandwidth *cfs_b) {}
 static inline void update_runtime_enabled(struct rq *rq) {}
 static inline void unthrottle_offline_cfs_rqs(struct rq *rq) {}
 
+#ifdef CONFIG_SCHED_WALT
+static void walt_fixup_sched_stats_fair(struct rq *rq, struct task_struct *p,
+					u16 updated_demand_scaled,
+					u16 updated_pred_demand_scaled)
+{
+	fixup_walt_sched_stats_common(rq, p, updated_demand_scaled,
+				      updated_pred_demand_scaled);
+}
+
+static void walt_fixup_nr_big_tasks(struct rq *rq, struct task_struct *p,
+				    int delta, bool inc)
+{
+	walt_adjust_nr_big_tasks(rq, delta, inc);
+}
+#endif
+
 #endif /* CONFIG_CFS_BANDWIDTH */
 
 /**************************************************
@@ -5563,6 +5730,11 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	int idle_h_nr_running = task_has_idle_policy(p);
 	int task_new = !(flags & ENQUEUE_WAKEUP);
 
+#ifdef CONFIG_SCHED_WALT
+	p->wts.misfit = !task_fits_max(p, rq->cpu);
+	p->wts.rtg_high_prio = task_rtg_high_prio(p);
+#endif
+
 #ifdef CONFIG_SEC_PERF_MANAGER
 	unsigned long next_fps_boosted_util;
 	int boosted_cnt;
@@ -5622,6 +5794,9 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 
 		cfs_rq->h_nr_running++;
 		cfs_rq->idle_h_nr_running += idle_h_nr_running;
+#if defined(CONFIG_SCHED_WALT) && defined(CONFIG_CFS_BANDWIDTH)
+		walt_inc_cfs_rq_stats(cfs_rq, p);
+#endif
 
 		/* end evaluation on encountering a throttled cfs_rq */
 		if (cfs_rq_throttled(cfs_rq))
@@ -5638,6 +5813,9 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 
 		cfs_rq->h_nr_running++;
 		cfs_rq->idle_h_nr_running += idle_h_nr_running;
+#if defined(CONFIG_SCHED_WALT) && defined(CONFIG_CFS_BANDWIDTH)
+		walt_inc_cfs_rq_stats(cfs_rq, p);
+#endif
 
 		/* end evaluation on encountering a throttled cfs_rq */
 		if (cfs_rq_throttled(cfs_rq))
@@ -5654,9 +5832,7 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 enqueue_throttle:
 	if (!se) {
 		add_nr_running(rq, 1);
-#ifdef CONFIG_SCHED_WALT
-		p->wts.misfit = !task_fits_max(p, rq->cpu);
-#endif
+		/* WALT accounting is updated with the task's cfs_rq hierarchy. */
 		inc_rq_walt_stats(rq, p);
 		/*
 		 * Since new tasks are assigned an initial util_avg equal to
@@ -5756,6 +5932,9 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 
 		cfs_rq->h_nr_running--;
 		cfs_rq->idle_h_nr_running -= idle_h_nr_running;
+#if defined(CONFIG_SCHED_WALT) && defined(CONFIG_CFS_BANDWIDTH)
+		walt_dec_cfs_rq_stats(cfs_rq, p);
+#endif
 
 		/* end evaluation on encountering a throttled cfs_rq */
 		if (cfs_rq_throttled(cfs_rq))
@@ -5784,6 +5963,9 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 
 		cfs_rq->h_nr_running--;
 		cfs_rq->idle_h_nr_running -= idle_h_nr_running;
+#if defined(CONFIG_SCHED_WALT) && defined(CONFIG_CFS_BANDWIDTH)
+		walt_dec_cfs_rq_stats(cfs_rq, p);
+#endif
 
 		/* end evaluation on encountering a throttled cfs_rq */
 		if (cfs_rq_throttled(cfs_rq))
@@ -11845,7 +12027,7 @@ static void task_tick_fair(struct rq *rq, struct task_struct *curr, int queued)
 	misfit = rq->misfit_task_load;
 
 	if (old_misfit != misfit) {
-		walt_adjust_nr_big_tasks(rq, 1, misfit);
+		walt_fixup_nr_big_tasks(rq, curr, 1, misfit);
 		curr->wts.misfit = misfit;
 	}
 #endif
@@ -12082,6 +12264,9 @@ void init_cfs_rq(struct cfs_rq *cfs_rq)
 {
 	cfs_rq->tasks_timeline = RB_ROOT_CACHED;
 	cfs_rq->min_vruntime = (u64)(-(1LL << 20));
+#if defined(CONFIG_SCHED_WALT) && defined(CONFIG_CFS_BANDWIDTH)
+	memset(&cfs_rq->walt_stats, 0, sizeof(cfs_rq->walt_stats));
+#endif
 #ifndef CONFIG_64BIT
 	cfs_rq->min_vruntime_copy = cfs_rq->min_vruntime;
 #endif
@@ -12363,6 +12548,10 @@ const struct sched_class fair_sched_class = {
 	.get_rr_interval	= get_rr_interval_fair,
 
 	.update_curr		= update_curr_fair,
+
+#ifdef CONFIG_SCHED_WALT
+	.fixup_walt_sched_stats = walt_fixup_sched_stats_fair,
+#endif
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	.task_change_group	= task_change_group_fair,
