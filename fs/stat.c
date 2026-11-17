@@ -146,6 +146,17 @@ int vfs_statx_fd(unsigned int fd, struct kstat *stat,
 	if (f.file) {
 		error = vfs_getattr(&f.file->f_path, stat,
 				    request_mask, query_flags);
+		if (!error) {
+			struct path *path = &f.file->f_path;
+
+			stat->mnt_id = real_mount(path->mnt)->mnt_id;
+			stat->result_mask |= STATX_MNT_ID;
+			if (request_mask & STATX_MNT_ID_UNIQUE)
+				stat->result_mask |= STATX_MNT_ID_UNIQUE;
+			if (path->mnt->mnt_root == path->dentry)
+				stat->attributes |= STATX_ATTR_MOUNT_ROOT;
+			stat->attributes_mask |= STATX_ATTR_MOUNT_ROOT;
+		}
 		fdput(f);
 	}
 	return error;
@@ -191,8 +202,15 @@ retry:
 		goto out;
 
 	error = vfs_getattr(&path, stat, request_mask, flags);
-	stat->mnt_id = real_mount(path.mnt)->mnt_id;
-	stat->result_mask |= STATX_MNT_ID;
+	if (!error) {
+		stat->mnt_id = real_mount(path.mnt)->mnt_id;
+		stat->result_mask |= STATX_MNT_ID;
+		if (request_mask & STATX_MNT_ID_UNIQUE)
+			stat->result_mask |= STATX_MNT_ID_UNIQUE;
+		if (path.mnt->mnt_root == path.dentry)
+			stat->attributes |= STATX_ATTR_MOUNT_ROOT;
+		stat->attributes_mask |= STATX_ATTR_MOUNT_ROOT;
+	}
 	path_put(&path);
 	if (retry_estale(error, lookup_flags)) {
 		lookup_flags |= LOOKUP_REVAL;
