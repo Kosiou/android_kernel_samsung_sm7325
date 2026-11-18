@@ -54,6 +54,14 @@ static const struct fs_parameter_description proc_fs_parameters = {
 	.specs		= proc_param_specs,
 };
 
+static bool proc_hidepid_name(const struct fs_parameter *param,
+			      const char *name)
+{
+	size_t len = strlen(name);
+
+	return param->size == len && !memcmp(param->string, name, len);
+}
+
 static int proc_parse_param(struct fs_context *fc, struct fs_parameter *param)
 {
 	struct proc_fs_context *ctx = fc->fs_private;
@@ -72,11 +80,11 @@ static int proc_parse_param(struct fs_context *fc, struct fs_parameter *param)
 	case Opt_hidepid:
 		if (!param->string)
 			return -EINVAL;
-		if (!strcmp(param->string, "off"))
+		if (proc_hidepid_name(param, "off"))
 			ctx->hidepid = HIDEPID_OFF;
-		else if (!strcmp(param->string, "noaccess"))
+		else if (proc_hidepid_name(param, "noaccess"))
 			ctx->hidepid = HIDEPID_NO_ACCESS;
-		else if (!strcmp(param->string, "invisible"))
+		else if (proc_hidepid_name(param, "invisible"))
 			ctx->hidepid = HIDEPID_INVISIBLE;
 		else if (kstrtoint(param->string, 0, &ctx->hidepid))
 			return invalf(fc, "proc: invalid hidepid value.\n");
