@@ -1,0 +1,609 @@
+name: build-sm7325
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_ref:
+        description: "要构建的内核分支、标签或提交 SHA"
+        type: string
+        required: true
+        default: main
+      use_ccache:
+        description: "启用 ccache"
+        type: boolean
+        default: true
+permissions:
+  contents: read
+
+concurrency:
+  group: sm7325-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  HYBRID_MOUNT_REPO: https://github.com/Hybrid-Mount/meta-hybrid_mount.git
+  REKERNEL_REPO: Sakion-Team/Re-Kernel
+  DEFCONFIG: vendor/gts7fewifi_eur_open_defconfig
+  DEVICE_CODENAME: gts7fewifi
+  LOCALVERSION_BASE: "-Kosiou"
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  TOOLCHAIN_BASE: ${{ github.workspace }}/toolchains
+
+jobs:
+  build:
+    name: "SM7325-KSU"
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      ksu_sha: ${{ steps.ksu_sha.outputs.ksu_sha }}
+      ksu_tag: ${{ steps.ksu_sha.outputs.ksu_tag }}
+      ksu_manager_url: ${{ steps.ksu_sha.outputs.ksu_manager_url }}
+
+    steps:
+      # ── 克隆内核源码 ───────────────────────────────────────────────
+      - name: 克隆内核源码
+        uses: actions/checkout@v4
+        with:
+          repository: Kosiou/android_kernel_samsung_sm7325
+          ref: ${{ inputs.kernel_ref }}
+          path: kernel
+          fetch-depth: 1
+
+      - name: 记录源码版本
+        working-directory: kernel
+        run: |
+          echo "分支/引用: ${{ inputs.kernel_ref }}"
+          echo "提交: $(git rev-parse HEAD)"
+          echo "摘要: $(git log -1 --format='%h %s')"
+          echo "ROOT=$GITHUB_WORKSPACE/kernel" >> "$GITHUB_ENV"
+
+      # ── 系统信息 ──────────────────────────────────────────────────
+      - name: 显示系统信息
+        run: |
+          echo "Runner: ${{ runner.os }} ($(uname -m))"
+          echo "Make: $(make --version | head -1)"
+          echo "GCC: $(gcc --version | head -1 2>/dev/null || echo 'not found')"
+          echo "CPU cores: $(nproc)"
+
+      # ── 安装编译依赖 ─────────────────────────────────────────────
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bison flex libelf-dev libdw-dev dwarves cpio unzip zip \
+            binutils bc libssl-dev python3 ccache git curl jq lld llvm rsync
+
+      # ── GNU Make 4.3（5.4 内核要求 < 4.4）────────────────────────
+      # ubuntu-latest (24.04) 自带 4.3, 仅在系统 make >= 4.4 时才编译
+      - name: 安装 GNU Make 4.3（仅系统版本过新时）
+        run: |
+          SYSTEM_MAJOR=$(make --version | head -1 | grep -oE '[0-9]+\.[0-9]+')
+          NEED_BUILD=false
+          if dpkg --compare-versions "$SYSTEM_MAJOR" ge "4.4"; then
+            NEED_BUILD=true
+          fi
+          if [ "$NEED_BUILD" = true ]; then
+            echo "系统 make $SYSTEM_MAJOR 过新, 编译 4.3..."
+            cd /tmp
+            curl -fsSL https://ftp.gnu.org/gnu/make/make-4.3.tar.gz -o make.tar.gz
+            tar xzf make.tar.gz
+            cd make-4.3
+            ./configure --prefix=/usr/local
+            make -j"$(nproc)"
+            sudo make install
+            echo "PATH=/usr/local/bin:$PATH" >> "$GITHUB_ENV"
+            /usr/local/bin/make --version | head -1
+          else
+            echo "系统 make $SYSTEM_MAJOR 可用, 跳过"
+          fi
+
+      # ── ccache ────────────────────────────────────────────────────
+      - name: 配置 ccache
+        if: inputs.use_ccache
+        run: |
+          mkdir -p "$CCACHE_DIR"
+          ccache --max-size=2G
+          ccache --set-config compression=true
+          echo "CCACHE_DIR=$CCACHE_DIR" >> "$GITHUB_ENV"
+
+      - name: 恢复 ccache
+        if: inputs.use_ccache
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: sm7325-ccache-${{ runner.os }}-${{ hashFiles('kernel/Makefile', 'kernel/arch/arm64/configs/vendor/gts7fewifi_eur_open_defconfig') }}-KSU
+          restore-keys: |
+            sm7325-ccache-${{ runner.os }}-
+
+      - name: 恢复工具链缓存
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.TOOLCHAIN_BASE }}
+          key: sm7325-toolchains-clang-r416183b-arm-gnu-14.2
+
+      # ── 下载工具链 ────────────────────────────────────────────────
+      # 来源: https://github.com/ravindu644/Android-Kernel-Tutorials
+      # 5.4 (qGKI) 需要: clang-r416183b + ARM GNU 14.2
+      - name: 下载工具链
+        id: toolchain
+        run: |
+          # clang 压缩包直接包含 bin/，解压根目录就是 TOOLCHAIN_BASE
+          CLANG_DIR="$TOOLCHAIN_BASE"
+          GCC_DIR="$TOOLCHAIN_BASE/arm-gnu-toolchain-14.2.rel1-x86_64-aarch64-none-linux-gnu"
+          CLANG_URL="https://github.com/ravindu644/Android-Kernel-Tutorials/releases/download/toolchains/clang-r416183b.tar.gz"
+          GCC_URL="https://github.com/ravindu644/Android-Kernel-Tutorials/releases/download/toolchains/arm-gnu-toolchain-14.2.rel1-x86_64-aarch64-none-linux-gnu.tar.xz"
+
+          CLANG_OK=false
+          GCC_OK=false
+          GCC_BIN="$GCC_DIR/bin"
+          GCC_PREFIX="aarch64-none-linux-gnu-"
+
+          # 检查是否已有
+          if [ -x "$CLANG_DIR/bin/clang" ]; then
+            echo "发现本地 clang: $CLANG_DIR/bin/clang"
+            CLANG_OK=true
+          fi
+          if [ -x "$GCC_BIN/${GCC_PREFIX}as" ]; then
+            echo "发现本地 gcc: $GCC_BIN/${GCC_PREFIX}as"
+            GCC_OK=true
+          fi
+
+          # 下载 clang-r416183b
+          if [ "$CLANG_OK" = false ]; then
+            echo "下载 clang-r416183b..."
+            mkdir -p "$TOOLCHAIN_BASE"
+            cd "$TOOLCHAIN_BASE"
+            curl -Lf --retry 3 --progress-bar "$CLANG_URL" -o clang.tar.gz
+            tar xzf clang.tar.gz
+            rm -f clang.tar.gz
+            if [ -x "$CLANG_DIR/bin/clang" ]; then
+              echo "clang 下载成功: $CLANG_DIR/bin/clang"
+              CLANG_OK=true
+            fi
+          fi
+
+          # 下载 ARM GNU 14.2
+          if [ "$GCC_OK" = false ]; then
+            echo "下载 ARM GNU toolchain 14.2..."
+            mkdir -p "$TOOLCHAIN_BASE"
+            cd "$TOOLCHAIN_BASE"
+            curl -Lf --retry 3 --progress-bar "$GCC_URL" -o gcc.tar.xz
+            tar xJf gcc.tar.xz
+            rm -f gcc.tar.xz
+            if [ -x "$GCC_BIN/${GCC_PREFIX}as" ]; then
+              echo "gcc 定位: $GCC_BIN/${GCC_PREFIX}as"
+              GCC_OK=true
+            fi
+          fi
+
+          if [ "$CLANG_OK" = false ]; then
+            echo "::error::clang-r416183b 下载失败"
+            exit 1
+          fi
+          if [ "$GCC_OK" = false ]; then
+            echo "::error::ARM GNU toolchain 下载失败"
+            exit 1
+          fi
+
+          echo "CLANG_DIR=$CLANG_DIR" >> "$GITHUB_ENV"
+          echo "GCC_DIR=$GCC_DIR" >> "$GITHUB_ENV"
+          echo "GCC_BIN=$GCC_BIN" >> "$GITHUB_ENV"
+          echo "GCC_PREFIX=$GCC_PREFIX" >> "$GITHUB_ENV"
+          echo "FOUND=true" >> "$GITHUB_OUTPUT"
+
+      # ── 建立 toolchain 软链接 ────────────────────────────────────
+      - name: 建立 toolchain 软链接
+        run: |
+          CLANG_DIR="${{ env.CLANG_DIR }}"
+          GCC_DIR="${{ env.GCC_DIR }}"
+          GCC_BIN="${{ env.GCC_BIN }}"
+          GCC_PREFIX="${{ env.GCC_PREFIX }}"
+          TOOLCHAIN_BIN="$GITHUB_WORKSPACE/kernel/toolchain/bin"
+          mkdir -p "$TOOLCHAIN_BIN"
+
+          # 清理旧链接
+          rm -f "$TOOLCHAIN_BIN"/aarch64-linux-gnu-* "$TOOLCHAIN_BIN"/cc "$TOOLCHAIN_BIN"/gcc "$TOOLCHAIN_BIN"/g++
+
+          # 找 clang 可执行文件
+          if [ -x "$CLANG_DIR/bin/clang" ]; then
+            CLANG="$CLANG_DIR/bin/clang"
+          elif ls "$CLANG_DIR/bin"/clang-12* &>/dev/null; then
+            CLANG=$(ls "$CLANG_DIR/bin"/clang-12* | head -1)
+          else
+            echo "::error::找不到 clang 可执行文件: $CLANG_DIR"
+            ls -la "$CLANG_DIR/bin/" 2>/dev/null | head -20
+            exit 1
+          fi
+
+          echo "Clang: $CLANG"
+          $CLANG --version | head -1
+
+          # 找 ARM GNU as/ld，并统一暴露为内核使用的 aarch64-linux-gnu 前缀
+          if [ -z "$GCC_BIN" ] || [ -z "$GCC_PREFIX" ] || [ ! -x "$GCC_BIN/${GCC_PREFIX}as" ]; then
+            echo "::error::未找到 ARM GNU assembler"
+            exit 1
+          fi
+
+          # 建立 aarch64 前缀链接
+          ln -sf "$CLANG" "$TOOLCHAIN_BIN/aarch64-linux-gnu-gcc"
+          ln -sf "$CLANG" "$TOOLCHAIN_BIN/cc"
+          ln -sf "$CLANG" "$TOOLCHAIN_BIN/gcc"
+          ln -sf "$CLANG" "$TOOLCHAIN_BIN/g++"
+
+          for tool in ld ar nm objcopy objdump strip; do
+            src="$CLANG_DIR/bin/llvm-${tool}"
+            [ -x "$src" ] && ln -sf "$src" "$TOOLCHAIN_BIN/aarch64-linux-gnu-${tool}"
+          done
+          # llvm-ar 有时叫 llvm-ar
+          [ -x "$CLANG_DIR/bin/llvm-ar" ] && ln -sf "$CLANG_DIR/bin/llvm-ar" "$TOOLCHAIN_BIN/aarch64-linux-gnu-ar"
+
+          # GNU as（5.4 内核需要外部 assembler）
+          ln -sf "$GCC_BIN/${GCC_PREFIX}as" "$TOOLCHAIN_BIN/aarch64-linux-gnu-as"
+          echo "GNU as: $GCC_BIN/${GCC_PREFIX}as"
+
+          echo "toolchain/bin:"
+          ls -la "$TOOLCHAIN_BIN"
+
+      # ── 集成 KernelSU (BakaSU, 原 ReSukiSU) ──────────────────────
+      # 固定克隆 BakaSU 并以 CONFIG_KSU=y 编入内核。
+      - name: 集成 KernelSU (BakaSU)
+        id: ksu_sha
+        run: |
+          KERNEL_ROOT="$GITHUB_WORKSPACE/kernel"
+          DRIVER_DIR="$KERNEL_ROOT/drivers"
+
+          # KSU is mandatory for this kernel; always integrate the pinned release.
+          KSU_RELEASES=$(curl --fail --location --silent --show-error \
+            --retry 5 --retry-all-errors --retry-delay 3 \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            -H 'Authorization: Bearer ${{ github.token }}' \
+            'https://api.github.com/repos/Baka-SU/BakaSU/releases?per_page=1')
+          KSU_TAG=$(jq -er '.[0].tag_name | select(type == "string" and length > 0)' <<< "$KSU_RELEASES")
+          KSU_MANAGER_URL=$(jq -er --arg tag "$KSU_TAG" '
+            [.[0].assets[]
+              | select(.name | contains($tag) and endswith("-arm64-v8a-release.apk"))
+              | .browser_download_url]
+            | if length == 1 then .[0] else error("expected one matching arm64 Manager APK") end
+          ' <<< "$KSU_RELEASES")
+          echo "Latest BakaSU release: $KSU_TAG"
+
+          git clone --depth=1 --branch "$KSU_TAG" \
+            https://github.com/Baka-SU/BakaSU.git "$KERNEL_ROOT/KernelSU"
+
+          # Keep the kernel driver and its signing-compatible Manager on one release.
+          KSU_SHA=$(git -C "$KERNEL_ROOT/KernelSU" rev-parse HEAD)
+          echo "ksu_sha=$KSU_SHA" >> "$GITHUB_OUTPUT"
+          echo "ksu_tag=$KSU_TAG" >> "$GITHUB_OUTPUT"
+          echo "ksu_manager_url=$KSU_MANAGER_URL" >> "$GITHUB_OUTPUT"
+          echo "BakaSU release commit: $KSU_SHA"
+
+          # KSU 集成入口由内核仓库维护；CI 只提供外部源码并校验，不改动内核树。
+          test -L "$DRIVER_DIR/kernelsu"
+          test -e "$DRIVER_DIR/kernelsu/Kconfig"
+          grep -q "source \"drivers/kernelsu/Kconfig\"" "$DRIVER_DIR/Kconfig"
+          grep -q "obj-\$(CONFIG_KSU) += kernelsu/" "$DRIVER_DIR/Makefile"
+          echo "KernelSU 集成入口: $(readlink "$DRIVER_DIR/kernelsu")"
+
+          echo "KernelSU 集成完成"
+
+      # ── 集成 Hybrid Mount VFS ────────────────────────────────────
+      - name: 集成 Hybrid Mount VFS
+        run: |
+          KERNEL_ROOT="$GITHUB_WORKSPACE/kernel"
+          SOURCE_DIR="$RUNNER_TEMP/meta-hybrid_mount"
+          RELEASE_TAG=$(curl --fail --location --silent --show-error --retry 3 \
+            https://api.github.com/repos/Hybrid-Mount/meta-hybrid_mount/releases/latest \
+            | jq -er '.tag_name | select(type == "string" and length > 0)')
+          echo "Latest Hybrid Mount release: $RELEASE_TAG"
+
+          mkdir -p "$SOURCE_DIR"
+          git -C "$SOURCE_DIR" init
+          git -C "$SOURCE_DIR" remote add origin "$HYBRID_MOUNT_REPO"
+          git -C "$SOURCE_DIR" fetch --depth=1 origin "refs/tags/$RELEASE_TAG"
+          git -C "$SOURCE_DIR" checkout --detach FETCH_HEAD
+
+          ACTUAL_COMMIT=$(git -C "$SOURCE_DIR" rev-parse HEAD)
+          echo "Hybrid Mount release commit: $ACTUAL_COMMIT"
+
+          cd "$KERNEL_ROOT"
+          "$SOURCE_DIR/module/vfs/setup.sh"
+          grep -qF 'source "fs/hybridmount/Kconfig"' fs/Kconfig
+          grep -qF 'obj-$(CONFIG_HYBRIDMOUNT) += hybridmount/' fs/Makefile
+
+      # ── 集成最新官方 Re-Kernel ────────────────────────────────────
+      - name: 集成 Re-Kernel
+        id: rekernel
+        run: |
+          set -euo pipefail
+          KERNEL_ROOT="$GITHUB_WORKSPACE/kernel"
+          SOURCE_DIR="$RUNNER_TEMP/Re-Kernel"
+          DEFCONFIG="$KERNEL_ROOT/arch/arm64/configs/vendor/gts7fewifi_eur_open_defconfig"
+
+          RELEASE=$(curl --fail --location --silent --show-error --retry 3 \
+            "https://api.github.com/repos/${REKERNEL_REPO}/releases/latest")
+          RELEASE_TAG=$(jq -er '.tag_name | select(type == "string" and length > 0)' <<< "$RELEASE")
+          echo "Latest Re-Kernel release: $RELEASE_TAG"
+
+          git clone --depth=1 --branch "$RELEASE_TAG" \
+            "https://github.com/${REKERNEL_REPO}.git" "$SOURCE_DIR"
+          RELEASE_SHA=$(git -C "$SOURCE_DIR" rev-parse HEAD)
+          echo "Re-Kernel release commit: $RELEASE_SHA"
+
+          # The upstream script targets generic ARM64 defconfig; this device builds its vendor defconfig.
+          if ! grep -qF 'arch/arm64/configs/defconfig' "$SOURCE_DIR/Integrate/patches.sh"; then
+            echo "::error::upstream Re-Kernel integration script no longer has the expected defconfig target"
+            exit 1
+          fi
+          sed -i \
+            's|arch/arm64/configs/defconfig|arch/arm64/configs/vendor/gts7fewifi_eur_open_defconfig|' \
+            "$SOURCE_DIR/Integrate/patches.sh"
+
+          cd "$KERNEL_ROOT"
+          bash "$SOURCE_DIR/Integrate/patches.sh"
+
+          # This 5.4 Binder UAPI lacks TF_UPDATE_TXN; keep upstream's optional coalescing path disabled.
+          if ! grep -q 'TF_UPDATE_TXN' "$KERNEL_ROOT/include/uapi/linux/android/binder.h"; then
+            sed -i '/#include <uapi\/linux\/android\/binder.h>/a\
+          #ifndef TF_UPDATE_TXN\
+          #define TF_UPDATE_TXN 0\
+          #endif' "$KERNEL_ROOT/drivers/android/binder.c"
+          fi
+
+          # The upstream script can skip unsupported anchors without failing, so verify every integration point.
+          test -f "$KERNEL_ROOT/drivers/rekernel/rekernel.c"
+          grep -qF 'source "drivers/rekernel/Kconfig"' "$KERNEL_ROOT/drivers/Kconfig"
+          grep -qF 'obj-$(CONFIG_REKERNEL) += rekernel/' "$KERNEL_ROOT/drivers/Makefile"
+          grep -qF 'rekernel_binder_transaction(reply, t, target_node, tr)' "$KERNEL_ROOT/drivers/android/binder.c"
+          grep -qF 'rekernel_report(SIGNAL' "$KERNEL_ROOT/kernel/signal.c"
+          grep -q '^CONFIG_REKERNEL=y$' "$DEFCONFIG"
+          grep -q '^CONFIG_REKERNEL_NETWORK=n$' "$DEFCONFIG"
+
+          echo "rekernel_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "rekernel_sha=$RELEASE_SHA" >> "$GITHUB_OUTPUT"
+
+      # ── 配置内核选项 ─────────────────────────────────────────────
+      - name: 配置内核选项
+        run: |
+          KERNEL_ROOT="$GITHUB_WORKSPACE/kernel"
+          DEFCONFIG="$KERNEL_ROOT/arch/arm64/configs/vendor/gts7fewifi_eur_open_defconfig"
+
+          # Hybrid Mount VFS is built into this kernel image.
+          sed -i '/^CONFIG_HYBRIDMOUNT=/d' "$DEFCONFIG"
+          echo "CONFIG_HYBRIDMOUNT=y" >> "$DEFCONFIG"
+
+          # Re-Kernel's official integration script owns these settings.
+          grep -q '^CONFIG_REKERNEL=y$' "$DEFCONFIG"
+          grep -q '^CONFIG_REKERNEL_NETWORK=n$' "$DEFCONFIG"
+
+          echo "── 关键配置 ──"
+          grep -E "CONFIG_USER_NS|CONFIG_KSU|CONFIG_HYBRIDMOUNT|CONFIG_REKERNEL|CONFIG_LRU_GEN|CONFIG_BUILD_ARM64_DT_OVERLAY|CONFIG_LOCALVERSION_AUTO|CONFIG_NAMESPACES|CONFIG_PID_NS|CONFIG_SYSVIPC|CONFIG_POSIX_MQUEUE" "$DEFCONFIG" || true
+
+      # ── 准备 AnyKernel3 ──────────────────────────────────────────
+      # 官方 osm0sis 版 + 内嵌 anykernel.sh（取自 Y 大佬可用包:
+      # 只刷 boot, do.devicecheck=0; WildKernels 分支写死了 5.10+ 检查
+      # 会把 5.4 内核 "Non-GKI device, abort." 拒刷）
+      - name: 准备 AnyKernel3
+        run: |
+          KERNEL_ROOT="$GITHUB_WORKSPACE/kernel"
+          AK3_DIR="$KERNEL_ROOT/build/AnyKernel3"
+          if [ ! -d "$AK3_DIR" ]; then
+            git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git "$AK3_DIR"
+          fi
+          rm -rf "$AK3_DIR/.git"
+          rm -f "$AK3_DIR/anykernel.sh" "$AK3_DIR/README.md"
+          printf '%s' 'IyMjIEFueUtlcm5lbDMgUmFtZGlzayBNb2QgU2NyaXB0CiMjIG9zbTBzaXMgQCB4ZGEtZGV2ZWxvcGVycwoKIyMjIEFueUtlcm5lbCBzZXR1cAojIGdsb2JhbCBwcm9wZXJ0aWVzCnByb3BlcnRpZXMoKSB7ICcKa2VybmVsLnN0cmluZz1UYWJTN0ZFLUtva3ViYW4tS2VybmVsCmRvLmRldmljZWNoZWNrPTAKZG8ubW9kdWxlcz0wCmRvLnN5c3RlbWxlc3M9MQpkby5jbGVhbnVwPTEKZG8uY2xlYW51cG9uYWJvcnQ9MApkZXZpY2UubmFtZTE9CmRldmljZS5uYW1lMj0KZGV2aWNlLm5hbWUzPQpzdXBwb3J0ZWQudmVyc2lvbnM9CnN1cHBvcnRlZC5wYXRjaGxldmVscz0Kc3VwcG9ydGVkLnZlbmRvcnBhdGNobGV2ZWxzPQonOyB9ICMgZW5kIHByb3BlcnRpZXMKCgojIyMgQW55S2VybmVsIGluc3RhbGwKIyMgYm9vdCBmaWxlcyBhdHRyaWJ1dGVzCmJvb3RfYXR0cmlidXRlcygpIHsKc2V0X3Blcm1fcmVjdXJzaXZlIDAgMCA3NTUgNjQ0ICRSQU1ESVNLLyo7CnNldF9wZXJtX3JlY3Vyc2l2ZSAwIDAgNzUwIDc1MCAkUkFNRElTSy9pbml0KiAkUkFNRElTSy9zYmluOwp9ICMgZW5kIGF0dHJpYnV0ZXMKCiMgYm9vdCBzaGVsbCB2YXJpYWJsZXMKQkxPQ0s9L2Rldi9ibG9jay9ieS1uYW1lL2Jvb3Q7CklTX1NMT1RfREVWSUNFPTA7ClJBTURJU0tfQ09NUFJFU1NJT049YXV0bzsKUEFUQ0hfVkJNRVRBX0ZMQUc9YXV0bzsKCiMgaW1wb3J0IGZ1bmN0aW9ucy92YXJpYWJsZXMgYW5kIHNldHVwIHBhdGNoaW5nIC0gc2VlIGZvciByZWZlcmVuY2UgKERPIE5PVCBSRU1PVkUpCi4gdG9vbHMvYWszLWNvcmUuc2g7CgojIGJvb3QgaW5zdGFsbApzcGxpdF9ib290OyAjIHVzZSBzcGxpdF9ib290IHRvIHNraXAgcmFtZGlzayB1bnBhY2ssIGUuZy4gZm9yIGRldmljZXMgd2l0aCBpbml0X2Jvb3QgcmFtZGlzawoKZmxhc2hfYm9vdDsgIyB1c2UgZmxhc2hfYm9vdCB0byBza2lwIHJhbWRpc2sgcmVwYWNrLCBlLmcuIGZvciBkZXZpY2VzIHdpdGggaW5pdF9ib290IHJhbWRpc2sKIyMgZW5kIGJvb3QgaW5zdGFsbAoKCiMjIGluaXRfYm9vdCBmaWxlcyBhdHRyaWJ1dGVzCiNpbml0X2Jvb3RfYXR0cmlidXRlcygpIHsKI3NldF9wZXJtX3JlY3Vyc2l2ZSAwIDAgNzU1IDY0NCAkUkFNRElTSy8qOwojc2V0X3Blcm1fcmVjdXJzaXZlIDAgMCA3NTAgNzUwICRSQU1ESVNLL2luaXQqICRSQU1ESVNLL3NiaW47CiN9ICMgZW5kIGF0dHJpYnV0ZXMKCiMgaW5pdF9ib290IHNoZWxsIHZhcmlhYmxlcwojQkxPQ0s9aW5pdF9ib290OwojSVNfU0xPVF9ERVZJQ0U9MTsKI1JBTURJU0tfQ09NUFJFU1NJT049YXV0bzsKI1BBVENIX1ZCTUVUQV9GTEFHPWF1dG87CgojIHJlc2V0IGZvciBpbml0X2Jvb3QgcGF0Y2hpbmcKI3Jlc2V0X2FrOwoKIyBpbml0X2Jvb3QgaW5zdGFsbAojZHVtcF9ib290OyAjIHVucGFjayByYW1kaXNrIHNpbmNlIGl0IGlzIHRoZSBuZXcgZmlyc3Qgc3RhZ2UgaW5pdCByYW1kaXNrIHdoZXJlIG92ZXJsYXkuZCBtdXN0IGdvCgojd3JpdGVfYm9vdDsKIyMgZW5kIGluaXRfYm9vdCBpbnN0YWxsCgoKIyMgdmVuZG9yX2tlcm5lbF9ib290IHNoZWxsIHZhcmlhYmxlcwojQkxPQ0s9dmVuZG9yX2tlcm5lbF9ib290OwojSVNfU0xPVF9ERVZJQ0U9MTsKI1JBTURJU0tfQ09NUFJFU1NJT049YXV0bzsKI1BBVENIX1ZCTUVUQV9GTEFHPWF1dG87CgojIHJlc2V0IGZvciB2ZW5kb3Jfa2VybmVsX2Jvb3QgcGF0Y2hpbmcKI3Jlc2V0X2FrOwoKIyB2ZW5kb3Jfa2VybmVsX2Jvb3QgaW5zdGFsbAojc3BsaXRfYm9vdDsgIyBza2lwIHVucGFjay9yZXBhY2sgcmFtZGlzaywgZS5nLiBmb3IgZHRiIG9uIGRldmljZXMgd2l0aCBoZHIgdjQgYW5kIHZlbmRvcl9rZXJuZWxfYm9vdAoKI2ZsYXNoX2Jvb3Q7CiMjIGVuZCB2ZW5kb3Jfa2VybmVsX2Jvb3QgaW5zdGFsbAoKCiMjIHZlbmRvcl9ib290IGZpbGVzIGF0dHJpYnV0ZXMKI3ZlbmRvcl9ib290X2F0dHJpYnV0ZXMoKSB7CiNzZXRfcGVybV9yZWN1cnNpdmUgMCAwIDc1NSA2NDQgJFJBTURJU0svKjsKI3NldF9wZXJtX3JlY3Vyc2l2ZSAwIDAgNzUwIDc1MCAkUkFNRElTSy9pbml0KiAkUkFNRElTSy9zYmluOwojfSAjIGVuZCBhdHRyaWJ1dGVzCgojIHZlbmRvcl9ib290IHNoZWxsIHZhcmlhYmxlcwojQkxPQ0s9dmVuZG9yX2Jvb3Q7CiNJU19TTE9UX0RFVklDRT0xOwojUkFNRElTS19DT01QUkVTU0lPTj1hdXRvOwojUEFUQ0hfVkJNRVRBX0ZMQUc9YXV0bzsKCiMgcmVzZXQgZm9yIHZlbmRvcl9ib290IHBhdGNoaW5nCiNyZXNldF9hazsKCiMgdmVuZG9yX2Jvb3QgaW5zdGFsbAojZHVtcF9ib290OyAjIHVzZSBzcGxpdF9ib290IHRvIHNraXAgcmFtZGlzayB1bnBhY2ssIGUuZy4gZm9yIGR0YiBvbiBkZXZpY2VzIHdpdGggaGRyIHY0IGJ1dCBubyB2ZW5kb3Jfa2VybmVsX2Jvb3QKCiN3cml0ZV9ib290OyAjIHVzZSBmbGFzaF9ib290IHRvIHNraXAgcmFtZGlzayByZXBhY2ssIGUuZy4gZm9yIGR0YiBvbiBkZXZpY2VzIHdpdGggaGRyIHY0IGJ1dCBubyB2ZW5kb3Jfa2VybmVsX2Jvb3QKIyMgZW5kIHZlbmRvcl9ib290IGluc3RhbGwKCg==' | base64 -d > "$AK3_DIR/anykernel.sh"
+          chmod +x "$AK3_DIR/anykernel.sh"
+          echo "AnyKernel3: $AK3_DIR"
+          head -8 "$AK3_DIR/anykernel.sh"
+
+      # ── 编译内核 ─────────────────────────────────────────────────
+      - name: 编译内核
+        id: compile
+        run: |
+          set -e
+          KERNEL_ROOT="$GITHUB_WORKSPACE/kernel"
+          TOOLCHAIN_BIN="$KERNEL_ROOT/toolchain/bin"
+          CLANG_DIR="${{ env.CLANG_DIR }}"
+
+          export PATH="$TOOLCHAIN_BIN:$CLANG_DIR/bin:$PATH"
+          export ARCH=arm64
+
+          # 5.4 qGKI 需要 CROSS_COMPILE（指向 ARM GNU as/ld）+ LLVM=1
+          # 根据 ravindu644 教程：5.4 需要 Clang + GCC cross compiler
+          export CROSS_COMPILE="$TOOLCHAIN_BIN/aarch64-linux-gnu-"
+          export AS="$TOOLCHAIN_BIN/aarch64-linux-gnu-as"
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export LLVM=1
+          export LD=ld.lld
+          export AR=llvm-ar
+          export NM=llvm-nm
+          export OBJCOPY=llvm-objcopy
+          export OBJDUMP=llvm-objdump
+          export STRIP=llvm-strip
+          # 与本地 build_local.sh 对齐；该树的一个旧驱动函数会触发 Clang Werror
+          export KCFLAGS="-Wno-error=unused-function"
+
+          # ccache: CC 经 export + make 命令行 DISABLE_WRAPPER=1 CC="$CC"
+          # 传入。wrapper 被禁用后不会拦截 warning, KCFLAGS 保留为双保险
+          VARIANT="resukisu"
+          if [ "${{ inputs.use_ccache }}" = "true" ] && command -v ccache &>/dev/null; then
+            export CC="ccache clang"
+            echo "ccache 已启用: CC=$CC"
+          else
+            export CC=clang
+          fi
+
+          OUT_DIR="$KERNEL_ROOT/out"
+          rm -rf "$OUT_DIR"
+          mkdir -p "$OUT_DIR"
+
+          LOCALVERSION="${{ env.LOCALVERSION_BASE }}"
+
+          echo "=============================================="
+          echo " SM7325 Kernel Build"
+          echo "=============================================="
+          echo " Device:    ${{ env.DEVICE_CODENAME }}"
+          echo " Defconfig: ${{ env.DEFCONFIG }}"
+          echo " Variant:   $VARIANT (KSU built-in)"
+          echo " Re-Kernel: ${{ steps.rekernel.outputs.rekernel_tag }} (${{ steps.rekernel.outputs.rekernel_sha }})"
+          echo " Version:   $LOCALVERSION"
+          echo " CC:        $CC"
+          echo " CROSS:     $CROSS_COMPILE"
+          echo " AS:        $AS"
+          echo " KCFLAGS:   $KCFLAGS"
+          echo " DTC_EXT:   $DTC_EXT"
+          echo " JOBS:      $(nproc)"
+          echo " OUT:       $OUT_DIR"
+          echo "=============================================="
+
+          MAKE_ARGS=( -j"$(nproc)" -C "$KERNEL_ROOT" O="$OUT_DIR"
+            ARCH=arm64
+            CROSS_COMPILE="$CROSS_COMPILE"
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            DTC_EXT="$KERNEL_ROOT/tools/dtc"
+            LOCALVERSION_AUTO=0
+            CONFIG_SECTION_MISMATCH_WARN_ONLY=y
+            KCFLAGS="$KCFLAGS"
+            LLVM=1
+            LD=ld.lld
+            # 三星树 Makefile 默认 CC=$(gcc-wrapper.py)，wrapper 会把任何
+            # 未白名单的 warning 升级为 fatal（如 techpack/audio lahaina.c
+            # 的 unused-function）。命令行传 CC 同时关掉 wrapper。
+            DISABLE_WRAPPER=1
+            CC="$CC" )
+
+          # [1/3] 生成 .config
+          echo ""; echo "[1/3] 生成 .config..."
+          make "${MAKE_ARGS[@]}" "${{ env.DEFCONFIG }}" 2>&1 | tee "$OUT_DIR/build.log"
+          # make 在管道里时 set -e 看不到退出码, 用 PIPESTATUS 检查
+          [ "${PIPESTATUS[0]}" -eq 0 ] || { echo "::error::defconfig 生成失败"; exit 1; }
+          grep -q '^CONFIG_HYBRIDMOUNT=y$' "$OUT_DIR/.config" || {
+            echo "::error::CONFIG_HYBRIDMOUNT=y missing from generated .config"
+            exit 1
+          }
+          grep -q '^CONFIG_LRU_GEN=y$' "$OUT_DIR/.config" || {
+            echo "::error::CONFIG_LRU_GEN=y missing from generated .config"
+            exit 1
+          }
+          grep -q '^CONFIG_LRU_GEN_ENABLED=y$' "$OUT_DIR/.config" || {
+            echo "::error::CONFIG_LRU_GEN_ENABLED=y missing from generated .config"
+            exit 1
+          }
+          grep -q '^CONFIG_REKERNEL=y$' "$OUT_DIR/.config" || {
+            echo "::error::CONFIG_REKERNEL=y missing from generated .config"
+            exit 1
+          }
+
+          # [2/3] 编译
+          echo ""; echo "[2/3] 编译内核..."
+          make "${MAKE_ARGS[@]}" LOCALVERSION="$LOCALVERSION" 2>&1 | tee -a "$OUT_DIR/build.log"
+          [ "${PIPESTATUS[0]}" -eq 0 ] || { echo "::error::内核编译失败, 见 build.log 末尾:"; tail -80 "$OUT_DIR/build.log"; exit 1; }
+
+          # 验证 Image
+          IMAGE="$OUT_DIR/arch/arm64/boot/Image"
+          if [ ! -f "$IMAGE" ]; then
+            echo "::error::Image 未找到: $IMAGE"
+            echo "构建日志 tail:"
+            tail -80 "$OUT_DIR/build.log" 2>/dev/null || true
+            exit 1
+          fi
+          echo ""
+          echo "✓ 内核编译成功"
+          echo "  大小: $(ls -lh "$IMAGE" | awk '{print $5}')"
+          echo "  版本: $(strings "$IMAGE" | grep 'Linux version' | head -1)"
+
+          # [3/3] 打包 AnyKernel3
+          echo ""; echo "[3/3] 打包 AnyKernel3..."
+          AK3_DIR="$KERNEL_ROOT/build/AnyKernel3"
+          rm -rf "${AK3_DIR}/Image" "${AK3_DIR}/dtb" "${AK3_DIR}/dtbo.img" "${AK3_DIR}/modules" 2>/dev/null || true
+
+          cp "$IMAGE" "$AK3_DIR/" && echo "  ✓ Image"
+          mkdir -p "$AK3_DIR/dtb"
+          find "$OUT_DIR/arch/arm64/boot/dts" -name "*.dtb" -exec cp {} "$AK3_DIR/dtb/" \; 2>/dev/null && echo "  ✓ DTB" || true
+          [ -f "$OUT_DIR/arch/arm64/boot/dtbo.img" ] && cp "$OUT_DIR/arch/arm64/boot/dtbo.img" "$AK3_DIR/" && echo "  ✓ DTBO" || true
+
+          # 收集模块；模块通常位于 drivers/、fs/ 等嵌套目录。
+          if find "$OUT_DIR" -type f -name '*.ko' -print -quit | grep -q .; then
+            mkdir -p "$AK3_DIR/modules"
+            find "$OUT_DIR" -name "*.ko" -not -path "*/vendor/*" -exec cp {} "$AK3_DIR/modules/" \; 2>/dev/null
+            echo "  ✓ Modules"
+          fi
+
+          # 让刷机包中的显示名称与本次构建一致，避免保留模板值。
+          sed -i "s/^kernel.string=.*/kernel.string=TabS7FE Kernel ${LOCALVERSION}/" "$AK3_DIR/anykernel.sh"
+
+          TIMESTAMP=$(date '+%Y%m%d-%H%M%S')
+          ZIP_NAME="TabS7FE_Kernel-${VARIANT}-KSU-ReKernel-${{ steps.rekernel.outputs.rekernel_tag }}-${TIMESTAMP}-GitHub.zip"
+          (cd "$AK3_DIR" && zip -r9 "$OUT_DIR/$ZIP_NAME" . -x '.git*' '*.gitignore' 'README*' '*placeholder')
+          sha256sum "$OUT_DIR/$ZIP_NAME" > "$OUT_DIR/$ZIP_NAME.sha256"
+
+          echo ""
+          echo "=============================================="
+          echo " BUILD SUCCESS"
+          echo "=============================================="
+          echo " Artifact: $OUT_DIR/$ZIP_NAME"
+          ls -lh "$OUT_DIR/$ZIP_NAME"
+          echo "=============================================="
+
+          echo "ZIP_PATH=$OUT_DIR/$ZIP_NAME" >> "$GITHUB_OUTPUT"
+          echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
+
+      # ── 上传产物 ──────────────────────────────────────────────────
+      - name: 上传内核 zip
+        uses: actions/upload-artifact@v6
+        with:
+          name: kernel-resukisu-KSU-ReKernel-${{ steps.rekernel.outputs.rekernel_tag }}
+          path: ${{ steps.compile.outputs.ZIP_PATH }}
+          retention-days: 14
+
+      - name: 上传校验和
+        uses: actions/upload-artifact@v6
+        with:
+          name: checksum-resukisu-KSU
+          path: ${{ steps.compile.outputs.ZIP_PATH }}.sha256
+          retention-days: 14
+
+      - name: 上传构建日志（失败时调试用）
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: buildlog-resukisu-KSU
+          path: ${{ github.workspace }}/kernel/out/build.log
+          retention-days: 7
+
+      - name: 上传 .config（始终，用于与 Y 大佬 IKCONFIG 对比排查 CRC）
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: config-resukisu-KSU
+          path: ${{ github.workspace }}/kernel/out/.config
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
+
+  # ── 配套管理器: 与内核使用同一 BakaSU release ──────────────────
+  # 自编管理器的签名不匹配内核；复用该 release 的官方 APK。
+  manager:
+    name: "BakaSU-Manager (配套 ${{ needs.build.outputs.ksu_tag }})"
+    runs-on: ubuntu-latest
+    needs: build
+    if: always() && needs.build.result == 'success'
+    timeout-minutes: 15
+
+    steps:
+      - name: 下载配套官方 release 管理器
+        run: |
+          MANAGER_URL="${{ needs.build.outputs.ksu_manager_url }}"
+          if [ -z "$MANAGER_URL" ]; then
+            echo "::error::matching BakaSU Manager APK URL was not produced"
+            exit 1
+          fi
+          curl --fail --location --silent --show-error --retry 3 -o manager.apk "$MANAGER_URL"
+          ls -lh manager.apk
+          cp manager.apk "$GITHUB_WORKSPACE/ReSukiSU-manager-${{ needs.build.outputs.ksu_tag }}.apk"
+
+      - name: 上传管理器 APK
+        uses: actions/upload-artifact@v6
+        with:
+          name: manager-${{ needs.build.outputs.ksu_tag }}-resukisu-KSU
+          path: ReSukiSU-manager-*.apk
+          retention-days: 14
