@@ -237,6 +237,7 @@ static void css_task_iter_skip(struct css_task_iter *it,
 static int cgroup_destroy_locked(struct cgroup *cgrp);
 static struct cgroup_subsys_state *css_create(struct cgroup *cgrp,
 					      struct cgroup_subsys *ss);
+static struct cgroup *cgroup_get_from_file(struct file *file);
 static void css_release(struct percpu_ref *ref);
 static void kill_css(struct cgroup_subsys_state *css);
 static int cgroup_addrm_files(struct cgroup_subsys_state *css,
@@ -4940,6 +4941,20 @@ static int cgroup_procs_write_permission(struct cgroup *src_cgrp,
 	return 0;
 }
 
+static int cgroup_may_write(struct cgroup *cgrp, struct super_block *sb)
+{
+	struct inode *inode;
+	int ret;
+
+	lockdep_assert_held(&cgroup_mutex);
+	inode = kernfs_get_inode(sb, cgrp->procs_file.kn);
+	if (!inode)
+		return -ENOMEM;
+	ret = inode_permission(inode, MAY_WRITE);
+	iput(inode);
+	return ret;
+}
+
 static ssize_t cgroup_procs_write(struct kernfs_open_file *of,
 				  char *buf, size_t nbytes, loff_t off)
 {
@@ -6149,6 +6164,107 @@ void cgroup_fork(struct task_struct *child)
 	INIT_LIST_HEAD(&child->cg_list);
 }
 
+static int cgroup_css_set_fork(struct kernel_clone_args *kargs)
+	__acquires(&cgroup_mutex) __acquires(&cgroup_threadgroup_rwsem)
+{
+	struct css_set *src_cset, *dst_cset;
+	struct cgroup *dst_cgrp;
+	struct file *file = NULL;
+	int ret = 0;
+
+	if (kargs->flags & CLONE_INTO_CGROUP)
+		mutex_lock(&cgroup_mutex);
+	cgroup_threadgroup_change_begin(current);
+
+	spin_lock_irq(&css_set_lock);
+	src_cset = task_css_set(current);
+	get_css_set(src_cset);
+	spin_unlock_irq(&css_set_lock);
+
+	if (!(kargs->flags & CLONE_INTO_CGROUP)) {
+		kargs->cset = src_cset;
+		return 0;
+	}
+
+	file = fget_raw(kargs->cgroup);
+	if (!file) {
+		ret = -EBADF;
+		goto err;
+	}
+	dst_cgrp = cgroup_get_from_file(file);
+	if (IS_ERR(dst_cgrp)) {
+		ret = PTR_ERR(dst_cgrp);
+		goto err;
+	}
+	if (!cgroup_on_dfl(dst_cgrp)) {
+		ret = -EBADF;
+		goto err_cgrp;
+	}
+	if (cgroup_is_dead(dst_cgrp)) {
+		ret = -ENODEV;
+		goto err_cgrp;
+	}
+
+	ret = cgroup_may_write(dst_cgrp, file_inode(file)->i_sb);
+	if (ret)
+		goto err_cgrp;
+
+	ret = cgroup_procs_write_permission(src_cset->dfl_cgrp, dst_cgrp,
+					    file_inode(file)->i_sb,
+					    current->nsproxy->cgroup_ns);
+	if (ret)
+		goto err_cgrp;
+	ret = cgroup_migrate_vet_dst(dst_cgrp);
+	if (ret)
+		goto err_cgrp;
+	if (!(kargs->flags & CLONE_THREAD) &&
+	    src_cset->dfl_cgrp->dom_cgrp != dst_cgrp->dom_cgrp) {
+		ret = -EOPNOTSUPP;
+		goto err_cgrp;
+	}
+
+	dst_cset = find_css_set(src_cset, dst_cgrp);
+	if (!dst_cset) {
+		ret = -ENOMEM;
+		goto err_cgrp;
+	}
+	put_css_set(src_cset);
+	fput(file);
+	kargs->cgrp = dst_cgrp;
+	kargs->cset = dst_cset;
+	return 0;
+
+err_cgrp:
+	cgroup_put(dst_cgrp);
+err:
+	if (file)
+		fput(file);
+	put_css_set(src_cset);
+	cgroup_threadgroup_change_end(current);
+	if (kargs->flags & CLONE_INTO_CGROUP)
+		mutex_unlock(&cgroup_mutex);
+	return ret;
+}
+
+static void cgroup_css_set_put_fork(struct kernel_clone_args *kargs)
+{
+	cgroup_threadgroup_change_end(current);
+	if (kargs->flags & CLONE_INTO_CGROUP) {
+		mutex_unlock(&cgroup_mutex);
+		if (kargs->cset) {
+			put_css_set(kargs->cset);
+			kargs->cset = NULL;
+		}
+		if (kargs->cgrp) {
+			cgroup_put(kargs->cgrp);
+			kargs->cgrp = NULL;
+		}
+	} else if (kargs->cset) {
+		put_css_set(kargs->cset);
+		kargs->cset = NULL;
+	}
+}
+
 /**
  * cgroup_can_fork - called on a new task before the process is exposed
  * @child: the task in question.
@@ -6157,13 +6273,18 @@ void cgroup_fork(struct task_struct *child)
  * returns an error, the fork aborts with that error code. This allows for
  * a cgroup subsystem to conditionally allow or deny new forks.
  */
-int cgroup_can_fork(struct task_struct *child)
+int cgroup_can_fork(struct task_struct *child,
+		    struct kernel_clone_args *kargs)
 {
 	struct cgroup_subsys *ss;
 	int i, j, ret;
 
+	ret = cgroup_css_set_fork(kargs);
+	if (ret)
+		return ret;
+
 	do_each_subsys_mask(ss, i, have_canfork_callback) {
-		ret = ss->can_fork(child);
+		ret = ss->can_fork(child, kargs->cset);
 		if (ret)
 			goto out_revert;
 	} while_each_subsys_mask();
@@ -6175,8 +6296,9 @@ out_revert:
 		if (j >= i)
 			break;
 		if (ss->cancel_fork)
-			ss->cancel_fork(child);
+			ss->cancel_fork(child, kargs->cset);
 	}
+	cgroup_css_set_put_fork(kargs);
 
 	return ret;
 }
@@ -6188,14 +6310,16 @@ out_revert:
  * This calls the cancel_fork() callbacks if a fork failed *after*
  * cgroup_can_fork() succeded.
  */
-void cgroup_cancel_fork(struct task_struct *child)
+void cgroup_cancel_fork(struct task_struct *child,
+			struct kernel_clone_args *kargs)
 {
 	struct cgroup_subsys *ss;
 	int i;
 
 	for_each_subsys(ss, i)
 		if (ss->cancel_fork)
-			ss->cancel_fork(child);
+			ss->cancel_fork(child, kargs->cset);
+	cgroup_css_set_put_fork(kargs);
 }
 
 /**
@@ -6208,9 +6332,12 @@ void cgroup_cancel_fork(struct task_struct *child)
  * cgroup_task_iter_start() - to guarantee that the new task ends up on its
  * list.
  */
-void cgroup_post_fork(struct task_struct *child)
+void cgroup_post_fork(struct task_struct *child,
+		      struct kernel_clone_args *kargs)
 {
 	struct cgroup_subsys *ss;
+	struct css_set *cset = kargs->cset;
+	bool cset_linked = false;
 	int i;
 
 	/*
@@ -6235,14 +6362,11 @@ void cgroup_post_fork(struct task_struct *child)
 	 * operation which transfers all tasks out of init_css_set.
 	 */
 	if (use_task_css_set_links) {
-		struct css_set *cset;
-
 		spin_lock_irq(&css_set_lock);
-		cset = task_css_set(current);
-		if (list_empty(&child->cg_list)) {
-			get_css_set(cset);
+		if (likely(child->pid) && list_empty(&child->cg_list)) {
 			cset->nr_tasks++;
 			css_set_move_task(child, NULL, cset, false);
+			cset_linked = true;
 		}
 
 		/*
@@ -6275,6 +6399,18 @@ void cgroup_post_fork(struct task_struct *child)
 	do_each_subsys_mask(ss, i, have_fork_callback) {
 		ss->fork(child);
 	} while_each_subsys_mask();
+
+	if (kargs->flags & CLONE_NEWCGROUP) {
+		struct css_set *old_cset = child->nsproxy->cgroup_ns->root_cset;
+
+		get_css_set(cset);
+		child->nsproxy->cgroup_ns->root_cset = cset;
+		put_css_set(old_cset);
+	}
+	if (!cset_linked)
+		put_css_set(cset);
+	kargs->cset = NULL;
+	cgroup_css_set_put_fork(kargs);
 }
 
 /**
@@ -6492,18 +6628,12 @@ EXPORT_SYMBOL_GPL(cgroup_get_from_path);
  * cgroup on success. ERR_PTR is returned if the cgroup
  * cannot be found.
  */
-struct cgroup *cgroup_get_from_fd(int fd)
+static struct cgroup *cgroup_get_from_file(struct file *f)
 {
 	struct cgroup_subsys_state *css;
 	struct cgroup *cgrp;
-	struct file *f;
-
-	f = fget_raw(fd);
-	if (!f)
-		return ERR_PTR(-EBADF);
 
 	css = css_tryget_online_from_dir(f->f_path.dentry, NULL);
-	fput(f);
 	if (IS_ERR(css))
 		return ERR_CAST(css);
 
@@ -6513,6 +6643,19 @@ struct cgroup *cgroup_get_from_fd(int fd)
 		return ERR_PTR(-EBADF);
 	}
 
+	return cgrp;
+}
+
+struct cgroup *cgroup_get_from_fd(int fd)
+{
+	struct cgroup *cgrp;
+	struct file *f;
+
+	f = fget_raw(fd);
+	if (!f)
+		return ERR_PTR(-EBADF);
+	cgrp = cgroup_get_from_file(f);
+	fput(f);
 	return cgrp;
 }
 EXPORT_SYMBOL_GPL(cgroup_get_from_fd);
