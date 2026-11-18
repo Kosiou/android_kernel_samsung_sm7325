@@ -34,6 +34,7 @@
 #define CLONE_IO		0x80000000	/* Clone io context */
 
 /* Flags for clone3(). */
+#define CLONE_CLEAR_SIGHAND 0x100000000ULL /* Clear signal handlers in the child. */
 #define CLONE_INTO_CGROUP 0x200000000ULL /* Clone into a specific cgroup. */
 
 #ifndef __ASSEMBLY__
