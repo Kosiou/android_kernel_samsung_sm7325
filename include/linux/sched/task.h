@@ -12,6 +12,8 @@
 
 struct task_struct;
 struct rusage;
+struct cgroup;
+struct css_set;
 union thread_union;
 
 /* All the bits taken by the old clone syscall. */
@@ -26,6 +28,9 @@ struct kernel_clone_args {
 	unsigned long stack;
 	unsigned long stack_size;
 	unsigned long tls;
+	int cgroup;
+	struct cgroup *cgrp;
+	struct css_set *cset;
 };
 
 /*

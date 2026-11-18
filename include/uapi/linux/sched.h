@@ -33,12 +33,16 @@
 #define CLONE_NEWNET		0x40000000	/* New network namespace */
 #define CLONE_IO		0x80000000	/* Clone io context */
 
+/* Flags for clone3(). */
+#define CLONE_INTO_CGROUP 0x200000000ULL /* Clone into a specific cgroup. */
+
 #ifndef __ASSEMBLY__
 /**
  * struct clone_args - arguments for the clone3 syscall
  * @flags:       Flags for the new process as listed above.
  *               All flags are valid except for CSIGNAL and
- *               CLONE_DETACHED.
+ *               CLONE_DETACHED. CLONE_INTO_CGROUP selects the
+ *               cgroup identified by @cgroup for the new process.
  * @pidfd:       If CLONE_PIDFD is set, a pidfd will be
  *               returned in this argument.
  * @child_tid:   If CLONE_CHILD_SETTID is set, the TID of the
@@ -58,6 +62,9 @@
  * @stack_size:  The size of the stack for the child process.
  * @tls:         If CLONE_SETTLS is set, the tls descriptor
  *               is set to tls.
+ * @set_tid:     Reserved ABI field. Nonzero values are unsupported here.
+ * @set_tid_size: Reserved ABI field. Nonzero values are unsupported here.
+ * @cgroup:      Target cgroup fd when CLONE_INTO_CGROUP is specified.
  *
  * The structure is versioned by size and thus extensible.
  * New struct members must go at the end of the struct and
@@ -72,10 +79,15 @@ struct clone_args {
 	__aligned_u64 stack;
 	__aligned_u64 stack_size;
 	__aligned_u64 tls;
+	__aligned_u64 set_tid;
+	__aligned_u64 set_tid_size;
+	__aligned_u64 cgroup;
 };
 #endif
 
 #define CLONE_ARGS_SIZE_VER0 64 /* sizeof first published struct */
+#define CLONE_ARGS_SIZE_VER1 80 /* sizeof struct with set_tid fields */
+#define CLONE_ARGS_SIZE_VER2 88 /* sizeof struct with cgroup field */
 
 /*
  * Scheduling policies
