@@ -18,6 +18,7 @@
 #include <linux/sched/stat.h>
 #include <linux/module.h>
 #include <linux/bitops.h>
+#include <linux/kernel.h>
 #include <linux/user_namespace.h>
 #include <linux/fs_context.h>
 #include <linux/mount.h>
@@ -26,6 +27,7 @@
 #include <linux/cred.h>
 #include <linux/magic.h>
 #include <linux/slab.h>
+#include <linux/string.h>
 
 #include "internal.h"
 
@@ -43,7 +45,7 @@ enum proc_param {
 
 static const struct fs_parameter_spec proc_param_specs[] = {
 	fsparam_u32("gid",	Opt_gid),
-	fsparam_u32("hidepid",	Opt_hidepid),
+	fsparam_string("hidepid",	Opt_hidepid),
 	{}
 };
 
@@ -68,7 +70,16 @@ static int proc_parse_param(struct fs_context *fc, struct fs_parameter *param)
 		break;
 
 	case Opt_hidepid:
-		ctx->hidepid = result.uint_32;
+		if (!param->string)
+			return -EINVAL;
+		if (!strcmp(param->string, "off"))
+			ctx->hidepid = HIDEPID_OFF;
+		else if (!strcmp(param->string, "noaccess"))
+			ctx->hidepid = HIDEPID_NO_ACCESS;
+		else if (!strcmp(param->string, "invisible"))
+			ctx->hidepid = HIDEPID_INVISIBLE;
+		else if (kstrtoint(param->string, 0, &ctx->hidepid))
+			return invalf(fc, "proc: invalid hidepid value.\n");
 		if (ctx->hidepid < HIDEPID_OFF ||
 		    ctx->hidepid > HIDEPID_INVISIBLE)
 			return invalf(fc, "proc: hidepid value must be between 0 and 2.\n");
